@@ -2,6 +2,9 @@
 #ifndef UNICODE
 #define UNICODE
 #endif
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00
+#endif
 #include "../core/mpv.h"
 #include "../core/wallpaper.h"
 
@@ -65,6 +68,7 @@ static struct {
     char tier_paths[MAX_TIERS][WP_PATH_MAX];
     wp_tier tiers[MAX_TIERS];
     int tier_count;
+    char preview[WP_PATH_MAX];
     wp_config config;
     wp_system system;
     wp_surface surface;
@@ -188,8 +192,21 @@ static void resolve_paths(void) {
         if (app.tier_count > 0) wcscpy(app.data_dir, data);
     }
     scan_tiers(app.variants);
+    for (int i = 0; i < 4 && !app.preview[0]; i++) {
+        swprintf(data, MAX_PATH, L"%ls%ls\\gargantua.gif", app.exe_dir, subdirs[i]);
+        if (file_exists(data)) to_utf8(data, app.preview, WP_PATH_MAX);
+    }
     swprintf(app.mpv_exe, MAX_PATH, L"%ls\\mpv.exe", app.exe_dir);
-    if (!file_exists(app.mpv_exe) && !SearchPathW(NULL, L"mpv.exe", NULL, MAX_PATH, app.mpv_exe, NULL)) app.mpv_exe[0] = 0;
+    if (file_exists(app.mpv_exe) || SearchPathW(NULL, L"mpv.exe", NULL, MAX_PATH, app.mpv_exe, NULL)) return;
+    const wchar_t *roots[] = {L"ProgramFiles", L"ProgramFiles", L"LOCALAPPDATA", L"USERPROFILE"};
+    const wchar_t *installs[] = {L"MPV Player", L"mpv", L"Programs\\mpv", L"scoop\\shims"};
+    for (int i = 0; i < 4; i++) {
+        wchar_t base[MAX_PATH];
+        if (!GetEnvironmentVariableW(roots[i], base, MAX_PATH)) continue;
+        swprintf(app.mpv_exe, MAX_PATH, L"%ls\\%ls\\mpv.exe", base, installs[i]);
+        if (file_exists(app.mpv_exe)) return;
+    }
+    app.mpv_exe[0] = 0;
 }
 
 static bool ipc_request(const char *command, int id, char *reply, size_t size) {
@@ -523,6 +540,11 @@ static bool choose_content(char *path, size_t size, bool *image) {
         }
     }
     int index = wp_pick_tier(app.tiers, app.tier_count, app.canvas.w, app.canvas.h, app.rate, app.config.prefs.fit);
+    if (index < 0 && app.preview[0]) {
+        snprintf(path, size, "%s", app.preview);
+        *image = true;
+        return true;
+    }
     if (index < 0) return false;
     snprintf(path, size, "%s", app.tier_paths[index]);
     return true;
@@ -695,16 +717,16 @@ static void stop_encoder(void) {
 }
 
 static void apply_state(void) {
-    double rate = wp_rate(&app.config.prefs, &app.system);
+    char path[WP_PATH_MAX];
+    bool image = false;
+    bool have = choose_content(path, sizeof path, &image);
+    double rate = image ? 1.0 : wp_rate(&app.config.prefs, &app.system);
     app.rate = rate;
     if (app.encoder && !wp_fitted_allowed(&app.system)) stop_encoder();
     bool covered = !wp_frozen(&app.system) && current_covered();
     wp_want want = wp_decide(&app.system, covered);
     if (want == WP_WANT_PLAY && !app.mpv && now() < app.retry_at) want = WP_WANT_RELEASE;
     wp_action action = wp_surface_step(&app.surface, want, rate, now(), WP_RELEASE_DELAY);
-    char path[WP_PATH_MAX];
-    bool image = false;
-    bool have = choose_content(path, sizeof path, &image);
     if (action.build && have && !app.mpv) start_mpv(path, image, action.start);
     else if (have && app.mpv && strcmp(path, app.playing) != 0) {
         switch_file(path, image, tier_index(app.playing) >= 0 && tier_index(path) >= 0);
@@ -840,8 +862,12 @@ static void show_menu(void) {
     AppendMenuW(menu, MF_STRING, ID_CHOOSE, L"Choose Video or Image…");
     AppendMenuW(menu, MF_STRING | (app.config.content == WP_CONTENT_BUILTIN ? MF_CHECKED : 0), ID_BUILTIN, L"Use Built-in Gargantua");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    swprintf(label, 64, L"Speed: %g×…", p->speed);
-    AppendMenuW(menu, MF_STRING, ID_SPEED, label);
+    char path[WP_PATH_MAX];
+    bool image = false;
+    bool still = choose_content(path, sizeof path, &image) && image;
+    if (still) wcscpy(label, L"Speed: not available for images");
+    else swprintf(label, 64, L"Speed: %g×…", p->speed);
+    AppendMenuW(menu, MF_STRING | (still ? MF_GRAYED : 0), ID_SPEED, label);
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, L"Fit");
     const wchar_t *fits[] = {L"Fill Screen", L"Fit Inside"};
@@ -977,7 +1003,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR line, int show
         MessageBoxW(NULL, L"mpv.exe was not found. Place it next to this program or add it to PATH.", NAME, MB_ICONERROR);
         return 1;
     }
-    if (app.tier_count == 0 && app.config.content == WP_CONTENT_BUILTIN) {
+    if (app.tier_count == 0 && !app.preview[0] && app.config.content == WP_CONTENT_BUILTIN) {
         MessageBoxW(NULL, L"No background videos were found next to this program.", NAME, MB_ICONERROR);
         return 1;
     }
