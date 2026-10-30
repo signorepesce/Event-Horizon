@@ -25,6 +25,7 @@ enum Pref {
     static let contentKind = "contentKind"
     static let contentPath = "contentPath"
     static let fit = "fit"
+    static let pauseWhenCovered = "pauseWhenCovered"
     static let halfSpeedOnBattery = "halfSpeedOnBattery"
     static let halfSpeedInLowPower = "slowOnLowPower"
 
@@ -34,6 +35,7 @@ enum Pref {
             contentKind: "",
             contentPath: "",
             fit: "fill",
+            pauseWhenCovered: true,
             halfSpeedOnBattery: false,
             halfSpeedInLowPower: false,
         ])
@@ -41,7 +43,7 @@ enum Pref {
 
     static var chosenSpeed: Double { wp_speed_clamp(number(speed)) }
     static var prefs: wp_prefs {
-        wp_prefs(speed: chosenSpeed, fit: Fit.current.core,
+        wp_prefs(speed: chosenSpeed, fit: Fit.current.core, pause_when_covered: flag(pauseWhenCovered),
                  half_speed_on_battery: flag(halfSpeedOnBattery), half_speed_in_low_power: flag(halfSpeedInLowPower))
     }
     static func flag(_ key: String) -> Bool { UserDefaults.standard.bool(forKey: key) }
@@ -1067,7 +1069,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var contentItem: NSMenuItem?
     private var loginItem: NSMenuItem?
     private var fitItems: [NSMenuItem] = []
-    private var savingItems: [NSMenuItem] = []
+    private var prefItems: [NSMenuItem] = []
     private let speedRow = SpeedRow()
 
     private var manualPause = false
@@ -1385,7 +1387,8 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 log("unfrozen")
             }
         }
-        let checkCoverage = !isFrozen && playback.isVideo && !surfaces.isEmpty
+        var prefs = Pref.prefs
+        let checkCoverage = !isFrozen && playback.isVideo && !surfaces.isEmpty && prefs.pause_when_covered
         let now = uptime()
         var want = WP_WANT_RELEASE
         for surface in surfaces.values {
@@ -1397,7 +1400,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 log("screen \(surface.displayID): covered=\(covered)")
             }
             surface.covered = covered
-            want = wp_want_merge(want, wp_decide(&state, covered))
+            want = wp_want_merge(want, wp_decide(&prefs, &state, covered))
         }
         let allowed = wp_fitted_allowed(&state)
         if let fitting, !allowed {
@@ -1474,7 +1477,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         reconcile(immediate: true)
     }
 
-    @objc private func toggleSaving(_ sender: NSMenuItem) {
+    @objc private func togglePref(_ sender: NSMenuItem) {
         guard let key = sender.representedObject as? String else { return }
         Pref.set(key, !Pref.flag(key))
         updatePlayback()
@@ -1617,6 +1620,11 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         pause.target = self
         menu.addItem(pause)
         pauseItem = pause
+        let whenCovered = NSMenuItem(title: "Pause When Covered", action: #selector(togglePref(_:)), keyEquivalent: "")
+        whenCovered.target = self
+        whenCovered.representedObject = Pref.pauseWhenCovered
+        menu.addItem(whenCovered)
+        prefItems.append(whenCovered)
         menu.addItem(.separator())
 
         let choose = NSMenuItem(title: "Choose Video or Image…", action: #selector(chooseBackground), keyEquivalent: "")
@@ -1651,11 +1659,11 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.sectionHeader(title: "Battery"))
         for (label, key) in [("Half Speed on Battery", Pref.halfSpeedOnBattery),
                              ("Half Speed in Low Power Mode", Pref.halfSpeedInLowPower)] {
-            let entry = NSMenuItem(title: label, action: #selector(toggleSaving(_:)), keyEquivalent: "")
+            let entry = NSMenuItem(title: label, action: #selector(togglePref(_:)), keyEquivalent: "")
             entry.target = self
             entry.representedObject = key
             menu.addItem(entry)
-            savingItems.append(entry)
+            prefItems.append(entry)
         }
         menu.addItem(.separator())
         let login = NSMenuItem(title: "Open at Login", action: #selector(toggleLogin), keyEquivalent: "")
@@ -1674,7 +1682,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         pauseItem?.title = manualPause ? "Resume" : "Pause"
         let rate = self.rate
         speedRow.speed = Pref.chosenSpeed
-        savingItems.forEach { $0.state = Pref.flag($0.representedObject as? String ?? "") ? .on : .off }
+        prefItems.forEach { $0.state = Pref.flag($0.representedObject as? String ?? "") ? .on : .off }
         let custom = !Pref.text(Pref.contentPath).isEmpty
         contentItem?.state = custom ? .off : .on
         loginItem?.state = opensAtLogin ? .on : .off

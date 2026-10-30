@@ -824,7 +824,7 @@ static void apply_state(void) {
     app.rate = rate;
     if (app.encoder > 0 && !wp_fitted_allowed(&app.system)) stop_encoder();
     bool covered = !app.wayland && !wp_frozen(&app.system) && current_covered();
-    wp_want want = wp_decide(&app.system, covered);
+    wp_want want = wp_decide(&app.config.prefs, &app.system, covered);
     if (want == WP_WANT_PLAY && app.mpv <= 0 && now() < app.retry_at) want = WP_WANT_RELEASE;
     wp_action action = wp_surface_step(&app.surface, want, rate, now(), WP_RELEASE_DELAY);
 
@@ -892,13 +892,15 @@ static int control(int argc, char **argv) {
             snprintf(line, sizeof line, "fit = %s", value);
             wp_config_parse(&app.config, line);
             i++;
-        } else if ((strcmp(arg, "--half-on-battery") == 0 || strcmp(arg, "--half-in-low-power") == 0) && value) {
+        } else if ((strcmp(arg, "--pause-when-covered") == 0 || strcmp(arg, "--half-on-battery") == 0 ||
+                    strcmp(arg, "--half-in-low-power") == 0) && value) {
             bool on;
             if (!wp_switch_parse(value, &on)) {
                 fprintf(stderr, "%s is on or off\n", arg);
                 return 2;
             }
-            if (strcmp(arg, "--half-on-battery") == 0) app.config.prefs.half_speed_on_battery = on;
+            if (strcmp(arg, "--pause-when-covered") == 0) app.config.prefs.pause_when_covered = on;
+            else if (strcmp(arg, "--half-on-battery") == 0) app.config.prefs.half_speed_on_battery = on;
             else app.config.prefs.half_speed_in_low_power = on;
             i++;
         } else if (strcmp(arg, "--set") == 0 && value) {
@@ -918,7 +920,8 @@ static int control(int argc, char **argv) {
         } else if (strcmp(arg, "--quit") == 0) {
             quit = true;
         } else if (strcmp(arg, "--pause") != 0 && strcmp(arg, "--resume") != 0) {
-            fprintf(stderr, "usage: %s [--speed N] [--fit fill|fit] [--half-on-battery on|off] [--half-in-low-power on|off]\n"
+            fprintf(stderr, "usage: %s [--speed N] [--fit fill|fit] [--pause-when-covered on|off]\n"
+                            "       [--half-on-battery on|off] [--half-in-low-power on|off]\n"
                             "       [--set FILE|builtin] [--pause|--resume] [--quit]\n", APP);
             return 2;
         }

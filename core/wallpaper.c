@@ -9,6 +9,7 @@
 void wp_prefs_default(wp_prefs *prefs) {
     prefs->speed = 1.0;
     prefs->fit = WP_FIT_FILL;
+    prefs->pause_when_covered = true;
     prefs->half_speed_on_battery = false;
     prefs->half_speed_in_low_power = false;
 }
@@ -42,6 +43,8 @@ static void apply(wp_config *config, const char *key, const char *value) {
     } else if (strcmp(key, "fit") == 0) {
         if (same_word(value, "fill")) p->fit = WP_FIT_FILL;
         else if (same_word(value, "fit")) p->fit = WP_FIT_FIT;
+    } else if (strcmp(key, "pause_when_covered") == 0) {
+        wp_switch_parse(value, &p->pause_when_covered);
     } else if (strcmp(key, "half_speed_on_battery") == 0) {
         wp_switch_parse(value, &p->half_speed_on_battery);
     } else if (strcmp(key, "half_speed_in_low_power") == 0) {
@@ -93,11 +96,12 @@ size_t wp_config_format(const wp_config *config, char *out, size_t size) {
     int written = snprintf(out, size,
         "speed = %.2f\n"
         "fit = %s\n"
+        "pause_when_covered = %s\n"
         "half_speed_on_battery = %s\n"
         "half_speed_in_low_power = %s\n"
         "content = %s\n"
         "path = %s\n",
-        p->speed, fit_name(p->fit), p->half_speed_on_battery ? "on" : "off", p->half_speed_in_low_power ? "on" : "off",
+        p->speed, fit_name(p->fit), p->pause_when_covered ? "on" : "off", p->half_speed_on_battery ? "on" : "off", p->half_speed_in_low_power ? "on" : "off",
         content_name(config->content), config->path);
     return written < 0 ? 0 : (size_t)written;
 }
@@ -161,9 +165,9 @@ bool wp_frozen(const wp_system *system) {
            system->session_inactive || system->hot;
 }
 
-wp_want wp_decide(const wp_system *system, bool covered) {
+wp_want wp_decide(const wp_prefs *prefs, const wp_system *system, bool covered) {
     if (wp_frozen(system)) return WP_WANT_RELEASE;
-    return covered ? WP_WANT_PAUSE : WP_WANT_PLAY;
+    return covered && prefs->pause_when_covered ? WP_WANT_PAUSE : WP_WANT_PLAY;
 }
 
 wp_want wp_want_merge(wp_want a, wp_want b) {

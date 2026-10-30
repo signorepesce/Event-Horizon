@@ -30,6 +30,7 @@ typedef enum { WP_CONTENT_BUILTIN, WP_CONTENT_VIDEO, WP_CONTENT_IMAGE } wp_conte
 typedef struct {
     double speed;
     wp_fit fit;
+    bool pause_when_covered;
     bool half_speed_on_battery;
     bool half_speed_in_low_power;
 } wp_prefs;
@@ -93,7 +94,7 @@ double wp_slider_position(double speed);
 
 double wp_rate(const wp_prefs *prefs, const wp_system *system);
 bool wp_frozen(const wp_system *system);
-wp_want wp_decide(const wp_system *system, bool covered);
+wp_want wp_decide(const wp_prefs *prefs, const wp_system *system, bool covered);
 wp_want wp_want_merge(wp_want a, wp_want b);
 
 bool wp_is_video_name(const char *name);

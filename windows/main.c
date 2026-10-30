@@ -31,7 +31,7 @@
 #define MAX_RECTS 512
 #define MAX_REGIONS 16
 
-enum { ID_PAUSE = 100, ID_CHOOSE, ID_BUILTIN, ID_SPEED, ID_BATTERY, ID_LOW_POWER, ID_LOGIN, ID_QUIT, ID_FIT = 200 };
+enum { ID_PAUSE = 100, ID_COVERED, ID_CHOOSE, ID_BUILTIN, ID_SPEED, ID_BATTERY, ID_LOW_POWER, ID_LOGIN, ID_QUIT, ID_FIT = 200 };
 
 static const GUID power_saving_status = {0xE00958C0, 0xC213, 0x4ACE, {0xAC, 0x77, 0xFE, 0xCC, 0xED, 0x2E, 0xEE, 0xA5}};
 
@@ -699,7 +699,7 @@ static void apply_state(void) {
     app.rate = rate;
     if (app.encoder && !wp_fitted_allowed(&app.system)) stop_encoder();
     bool covered = !wp_frozen(&app.system) && current_covered();
-    wp_want want = wp_decide(&app.system, covered);
+    wp_want want = wp_decide(&app.config.prefs, &app.system, covered);
     if (want == WP_WANT_PLAY && !app.mpv && now() < app.retry_at) want = WP_WANT_RELEASE;
     wp_action action = wp_surface_step(&app.surface, want, rate, now(), WP_RELEASE_DELAY);
     char path[WP_PATH_MAX];
@@ -836,6 +836,7 @@ static void show_menu(void) {
     HMENU menu = CreatePopupMenu();
     wchar_t label[64];
     AppendMenuW(menu, MF_STRING, ID_PAUSE, app.system.manual_pause ? L"Resume" : L"Pause");
+    AppendMenuW(menu, MF_STRING | (p->pause_when_covered ? MF_CHECKED : 0), ID_COVERED, L"Pause When Covered");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, ID_CHOOSE, L"Choose Video or Image…");
     AppendMenuW(menu, MF_STRING | (app.config.content == WP_CONTENT_BUILTIN ? MF_CHECKED : 0), ID_BUILTIN, L"Use Built-in Gargantua");
@@ -869,6 +870,7 @@ static void command(UINT id) {
         return;
     }
     if (id == ID_PAUSE) app.system.manual_pause = !app.system.manual_pause;
+    else if (id == ID_COVERED) p->pause_when_covered = !p->pause_when_covered;
     else if (id == ID_CHOOSE) {
         choose_file();
         return;
