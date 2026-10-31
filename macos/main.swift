@@ -14,8 +14,9 @@ func log(_ message: @autoclosure () -> String) {
 }
 
 func supportFolder() -> URL {
-    let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        .appendingPathComponent("Event Horizon", isDirectory: true)
+    let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+        ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support", isDirectory: true)
+    let base = root.appendingPathComponent("Event Horizon", isDirectory: true)
     try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
     return base
 }
@@ -119,7 +120,7 @@ struct Library {
         return String(cString: buffer)
     }
 
-    static func load() -> Library {
+    static func load(excluding broken: Set<URL> = []) -> Library {
         let manager = FileManager.default
         let bundled = Bundle.main.resourceURL.flatMap {
             try? manager.contentsOfDirectory(at: $0, includingPropertiesForKeys: nil)
@@ -130,7 +131,7 @@ struct Library {
         var tiers: [wp_tier] = []
         for url in files.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
             var tier = wp_tier()
-            guard wp_tier_parse(url.path, &tier) else { continue }
+            guard !broken.contains(url), wp_tier_parse(url.path, &tier) else { continue }
             urls.append(url)
             tiers.append(tier)
         }
@@ -269,8 +270,14 @@ enum Transcoder {
         semaphore.wait()
         if let loadError { throw loadError }
         guard let info = loaded else { throw Failure("The file could not be read.") }
+        let oriented = info.size.applying(info.transform)
+        let shown = CGSize(width: abs(oriented.width), height: abs(oriented.height))
+        guard shown.width >= 1, shown.height >= 1, target.width >= 16, target.height >= 16,
+              shown.width.isFinite, shown.height.isFinite else {
+            throw Failure("The video has no usable picture size.")
+        }
 
-        let fps = max(1, min(60, Int(info.fps.rounded())))
+        let fps = info.fps.isFinite && info.fps >= 1 ? min(60, Int(info.fps.rounded())) : 30
         let reader = try AVAssetReader(asset: asset)
         let readerOutput = AVAssetReaderTrackOutput(track: info.track, outputSettings: [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
@@ -313,10 +320,9 @@ enum Transcoder {
         let context = CIContext(options: [.workingColorSpace: NSNull(), .cacheIntermediates: false])
         let lanczos = CIFilter.lanczosScaleTransform()
         let crop = CGRect(origin: .zero, size: target)
-        let oriented = info.size.applying(info.transform)
-        let shown = CGSize(width: abs(oriented.width), height: abs(oriented.height))
         let scale = max(target.width / shown.width, target.height / shown.height)
-        let totalFrames = max(1.0, info.duration.seconds * Double(fps))
+        let seconds = info.duration.seconds
+        let totalFrames = seconds.isFinite && seconds > 0 ? seconds * Double(fps) : 1
         var frames = 0
 
         while let sample = readerOutput.copyNextSampleBuffer() {
@@ -486,7 +492,7 @@ final class WallpaperView: NSView {
         root.addSublayer(still)
     }
 
-    required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
+    required init?(coder: NSCoder) { nil }
 
     override var isOpaque: Bool { true }
 
@@ -619,6 +625,8 @@ final class Playback {
     private var settled: Set<CGDirectDisplayID> = []
     private var generation = 0
     private var length = 0.0
+    private var looperObserver: NSKeyValueObservation?
+    var onFailure: ((Background) -> Void)?
 
     private let still: StillMaker
     private let stillSize: () -> CGSize
@@ -663,7 +671,27 @@ final class Playback {
 
     private var position: Double {
         let time = player?.currentTime().seconds ?? 0
+        guard time.isFinite, time > 0 else { return 0 }
         return length > 0 ? fmod(time, length) : time
+    }
+
+    func clear() {
+        teardown()
+        background = nil
+        length = 0
+        stillImage = nil
+        stillPending = false
+        pendingSeek = nil
+        showStill(nil)
+        wp_surface_init(&core)
+        wp_choice_init(&choice)
+    }
+
+    private func failed() {
+        guard let broken = background else { return }
+        log("cannot play \(broken.url.lastPathComponent)")
+        clear()
+        onFailure?(broken)
     }
 
     func refresh() {
@@ -751,6 +779,7 @@ final class Playback {
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.background == content else { return }
                     self.stillPending = false
+                    guard let image else { return self.failed() }
                     self.stillImage = image
                     self.showStill(image)
                     finish?()
@@ -789,7 +818,12 @@ final class Playback {
         queue.automaticallyWaitsToMinimizeStalling = false
         queue.preventsDisplaySleepDuringVideoPlayback = false
         queue.actionAtItemEnd = .advance
-        looper = AVPlayerLooper(player: queue, templateItem: item)
+        let looper = AVPlayerLooper(player: queue, templateItem: item)
+        self.looper = looper
+        looperObserver = looper.observe(\.status, options: [.initial, .new]) { [weak self] looper, _ in
+            guard looper.status == .failed else { return }
+            DispatchQueue.main.async { self?.failed() }
+        }
         player = queue
         seeking = false
         settled = []
@@ -824,6 +858,7 @@ final class Playback {
             seeking = true
             var target = seek.time + (uptime() - seek.at) * seek.rate
             if length > 0 { target = fmod(target, length) }
+            if !target.isFinite || target < 0 { target = 0 }
             let tolerance = CMTime(value: 1, timescale: 60)
             let mark = generation
             queue.seek(to: CMTime(seconds: target, preferredTimescale: 600),
@@ -854,6 +889,7 @@ final class Playback {
     }
 
     private func retire() {
+        looperObserver?.invalidate(); looperObserver = nil
         readyObservers.values.forEach { $0.invalidate() }
         readyObservers = [:]
         itemObserver?.invalidate(); itemObserver = nil
@@ -875,6 +911,7 @@ final class Playback {
 
     func teardown() {
         generation += 1
+        looperObserver?.invalidate(); looperObserver = nil
         readyObservers.values.forEach { $0.invalidate() }
         readyObservers = [:]
         itemObserver?.invalidate(); itemObserver = nil
@@ -944,7 +981,7 @@ enum WallpaperWriter {
             let width = Int(screen.frame.width * scale), height = Int(screen.frame.height * scale)
             guard width > 0, height > 0,
                   let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
-                                          bytesPerRow: 0, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                          bytesPerRow: 0, space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
                                           bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue)
             else { continue }
             context.setFillColor(CGColor(gray: 0, alpha: 1))
@@ -1050,12 +1087,14 @@ final class SpeedRow: NSView, NSTextFieldDelegate {
     }
 }
 
-final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
+final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemValidation {
     private var surfaces: [CGDirectDisplayID: Surface] = [:]
     private var library = Library.load()
     private let still = StillMaker()
     private lazy var playback = Playback(still: still) { [unowned self] in self.canvasBacking }
     private var lastBacking = CGSize.zero
+    private var broken: Set<URL> = []
+    private var wallpaperAttempts = (signature: "", count: 0)
     private var fitting: (process: Process, name: String)?
     private var pendingFit: (work: DispatchWorkItem, name: String)?
     private var refusedFits: Set<String> = []
@@ -1095,15 +1134,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         retirePreviousInstances()
         try? FileManager.default.removeItem(at: Library.variantsFolder.appendingPathComponent("tmp", isDirectory: true))
 
-        guard !library.tiers.isEmpty else {
-            let alert = NSAlert()
-            alert.messageText = "No background video was found."
-            alert.informativeText = "At least one file named Gargantua-<width>x<height>.mp4 must be present in Resources."
-            alert.runModal()
-            NSApp.terminate(nil)
-            return
-        }
-
+        playback.onFailure = { [weak self] content in self?.contentFailed(content) }
         buildMenu()
         reconcile()
 
@@ -1195,7 +1226,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard !area.isNull else { return }
         let rate = self.rate
         lastRate = rate
-        guard let content = background(for: canvasBacking, rate: rate) else { return }
+        guard let content = background(for: canvasBacking, rate: rate) else { return clearSurfaces() }
         let sameLoop = builtIn && playback.background.map { library.urls.contains($0.url) } == true
         var live = Set<CGDirectDisplayID>()
         for screen in NSScreen.screens {
@@ -1221,6 +1252,36 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         considerFitted(content)
         updatePlayback()
         syncSystemWallpaper()
+    }
+
+    private func clearSurfaces() {
+        pendingFit?.work.cancel()
+        pendingFit = nil
+        playback.clear()
+        surfaces.values.forEach { $0.dispose() }
+        surfaces = [:]
+        playback.attach([])
+        log("nothing to show: no readable background")
+    }
+
+    private func contentFailed(_ content: Background) {
+        if library.urls.contains(content.url) {
+            broken.insert(content.url)
+            if library.isFitted(content.url) { try? FileManager.default.removeItem(at: content.url) }
+            library = Library.load(excluding: broken)
+            reconcile(immediate: true)
+            return
+        }
+        Pref.set(Pref.contentPath, "")
+        Pref.set(Pref.contentKind, "")
+        reconcile(immediate: true)
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "That background cannot be shown."
+        alert.informativeText = library.tiers.isEmpty
+            ? "\(content.url.lastPathComponent) could not be decoded."
+            : "\(content.url.lastPathComponent) could not be decoded, so the built-in background is back."
+        alert.runModal()
     }
 
     private func considerFitted(_ content: Background) {
@@ -1290,7 +1351,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         pruneFitted(keeping: destination)
-        library = Library.load()
+        library = Library.load(excluding: broken)
         log("fitted \(name): \(String(format: "%.3f", produced)) s, variants \(library.summary)")
         reconcile(immediate: true)
     }
@@ -1316,6 +1377,9 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let content = background(for: canvasBacking, rate: rate) else { return }
         let signature = "\(content.url.path)|\(area)|\(Pref.text(Pref.fit))"
         guard signature != lastWallpaperSignature else { return }
+        if wallpaperAttempts.signature != signature { wallpaperAttempts = (signature, 0) }
+        guard wallpaperAttempts.count < 3 else { return }
+        wallpaperAttempts.count += 1
         lastWallpaperSignature = signature
         guard let executable = Bundle.main.executableURL else { return }
         let helper = Process()
@@ -1683,8 +1747,8 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let rate = self.rate
         speedRow.speed = Pref.chosenSpeed
         prefItems.forEach { $0.state = Pref.flag($0.representedObject as? String ?? "") ? .on : .off }
-        let custom = !Pref.text(Pref.contentPath).isEmpty
-        contentItem?.state = custom ? .off : .on
+        let custom = !builtIn
+        contentItem?.state = custom || library.tiers.isEmpty ? .off : .on
         loginItem?.state = opensAtLogin ? .on : .off
         let fit = Pref.text(Pref.fit)
         fitItems.forEach { $0.state = ($0.representedObject as? String) == fit ? .on : .off }
@@ -1698,10 +1762,11 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 name = "\(tier.width)×\(tier.height) · \(tier.fps) fps"
             case .video(let url): name = url.lastPathComponent
             }
-        } else { name = "—" }
+        } else { name = library.tiers.isEmpty ? "Built-in video missing" : "Nothing to show" }
 
         let reason: String
         if converting { reason = "converting" }
+        else if playback.background == nil { reason = "choose a video or image" }
         else if playback.background?.isVideo == false { reason = "still image" }
         else if manualPause { reason = "paused" }
         else if displayAsleep || locked || screensaver || sessionInactive { reason = "frozen, display off" }
@@ -1709,6 +1774,10 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         else if playback.state != WP_PLAYING && !surfaces.isEmpty { reason = "paused, covered" }
         else { reason = String(format: rate < Pref.chosenSpeed ? "playing %g×, half speed" : "playing %g×", rate) }
         stateItem?.title = "\(name) · \(reason)"
+    }
+
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        item !== contentItem || !library.tiers.isEmpty
     }
 
     @objc private func togglePause() {
@@ -1741,8 +1810,9 @@ if let flag = CommandLine.arguments.firstIndex(of: "--convert") {
     }
     let source = URL(fileURLWithPath: path)
     let size: CGSize
+    let sides = 16...Double(WP_DIMENSION_MAX)
     if rest.count > 1, let pair = rest.dropFirst().first?.split(separator: "x"), pair.count == 2,
-       let w = Double(pair[0]), let h = Double(pair[1]) {
+       let w = Double(pair[0]), let h = Double(pair[1]), sides.contains(w), sides.contains(h) {
         size = CGSize(width: w, height: h)
     } else {
         let screen = NSScreen.screens.first

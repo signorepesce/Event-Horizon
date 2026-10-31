@@ -21,6 +21,7 @@
 #define WP_LOOP_SPAN 21600.0
 #define WP_LOOP_REPEATS_MAX 10000
 #define WP_ASPECT_TOLERANCE 0.01
+#define WP_DIMENSION_MAX 32768
 
 typedef struct { double x, y, w, h; } wp_rect;
 

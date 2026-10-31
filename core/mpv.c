@@ -163,7 +163,7 @@ static bool find_box(wp_read_fn read, void *context, uint64_t from, uint64_t to,
         } else if (length == 0) {
             length = to - at;
         }
-        if (length < header || at + length > to) return false;
+        if (length < header || length > to - at) return false;
         if (memcmp(head + 4, type, 4) == 0) {
             *body = at + header;
             *end = at + length;

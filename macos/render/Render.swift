@@ -4,14 +4,20 @@ import CoreVideo
 import CoreImage
 import AVFoundation
 
-let folder = URL(fileURLWithPath: CommandLine.arguments[1])
-let width = Int(CommandLine.arguments[2])!
-let height = Int(CommandLine.arguments[3])!
-let seconds = Int(CommandLine.arguments[4])!
+func fail(_ message: String) -> Never {
+    FileHandle.standardError.write(Data((message + "\n").utf8))
+    exit(1)
+}
+
+let arguments = CommandLine.arguments
+guard arguments.count == 5, let width = Int(arguments[2]), let height = Int(arguments[3]), let seconds = Int(arguments[4]),
+      width >= 16, height >= 16, seconds >= 0 else {
+    fail("usage: render <folder> <width> <height> <seconds>")
+}
+let folder = URL(fileURLWithPath: arguments[1])
 let fps = 60
-let device = MTLCreateSystemDefaultDevice()!
+guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else { fail("No Metal GPU was found.") }
 print("GPU: \(device.name); \(width)×\(height)")
-let queue = device.makeCommandQueue()!
 let shader = try String(contentsOf: URL(fileURLWithPath: #filePath).deletingLastPathComponent()
     .appendingPathComponent("Gargantua.metal"), encoding: .utf8)
 let lib = try device.makeLibrary(source: shader, options: nil)
@@ -45,7 +51,7 @@ func encode(_ cb: MTLCommandBuffer, _ p: MTLComputePipelineState, _ ts: [MTLText
 let setup = queue.makeCommandBuffer()!
 encode(setup,geometry,[map],width,height,SIMD4(0,0,0,0))
 setup.commit(); setup.waitUntilCompleted()
-if let error = setup.error { fatalError("Geometry: \(error)") }
+if let error = setup.error { fail("Geometry: \(error)") }
 print("Lensing map ready")
 var cache: CVMetalTextureCache?
 CVMetalTextureCacheCreate(nil,nil,device,nil,&cache)
@@ -68,9 +74,10 @@ func render(_ phase: Float, save: String? = nil) -> CVPixelBuffer {
     encode(cb,blur,[bloomA,bloomB],width/4,height/4,SIMD4(0,1,0,0))
     encode(cb,composite,[radiance,bloomB,target],width,height,SIMD4(phase,0,0,0))
     cb.commit(); cb.waitUntilCompleted()
-    if let error = cb.error { fatalError("Render: \(error)") }
+    if let error = cb.error { fail("Render: \(error)") }
     if let save = save {
-        try! context.writePNGRepresentation(of:CIImage(cvPixelBuffer:buffer),to:folder.appendingPathComponent(save),format:.RGBA8,colorSpace:cs)
+        do { try context.writePNGRepresentation(of:CIImage(cvPixelBuffer:buffer),to:folder.appendingPathComponent(save),format:.RGBA8,colorSpace:cs) }
+        catch { fail("Saving \(save): \(error.localizedDescription)") }
     }
     return buffer
 }
@@ -85,15 +92,15 @@ let input = AVAssetWriterInput(mediaType:.video,outputSettings:[AVVideoCodecKey:
 input.expectsMediaDataInRealTime = false
 let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput:input,sourcePixelBufferAttributes:attributes)
 writer.add(input)
-guard writer.startWriting() else { fatalError("Writer start: \(String(describing:writer.error))") }
+guard writer.startWriting() else { fail("Writer start: \(String(describing:writer.error))") }
 writer.startSession(atSourceTime:.zero)
 let start = Date()
 for frame in 0..<(seconds*fps) {
     autoreleasepool {
         while !input.isReadyForMoreMediaData && writer.status == .writing { Thread.sleep(forTimeInterval:0.005) }
-        guard writer.status == .writing else { fatalError("Writer: \(String(describing:writer.error))") }
+        guard writer.status == .writing else { fail("Writer: \(String(describing:writer.error))") }
         let pixel = render(Float(frame)/Float(seconds*fps)*2*Float.pi,save:frame == 0 ? "Gargantua-\(width)x\(height).png" : nil)
-        guard adaptor.append(pixel,withPresentationTime:CMTime(value:Int64(frame),timescale:Int32(fps))) else { fatalError("Append: \(String(describing:writer.error))") }
+        guard adaptor.append(pixel,withPresentationTime:CMTime(value:Int64(frame),timescale:Int32(fps))) else { fail("Append: \(String(describing:writer.error))") }
     }
     if frame % 60 == 0 { print("Frame \(frame)/\(seconds*fps), elapsed \(Int(Date().timeIntervalSince(start)))s"); fflush(stdout) }
 }
@@ -101,5 +108,5 @@ input.markAsFinished()
 let done = DispatchSemaphore(value:0)
 writer.finishWriting { done.signal() }
 done.wait()
-guard writer.status == .completed else { fatalError("Finish: \(String(describing:writer.error))") }
+guard writer.status == .completed else { fail("Finish: \(String(describing:writer.error))") }
 print("Saved \(output.path)")

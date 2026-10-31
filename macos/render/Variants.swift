@@ -5,8 +5,15 @@ import CoreImage
 import CoreImage.CIFilterBuiltins
 import Metal
 
+func fail(_ message: String) -> Never {
+    FileHandle.standardError.write(Data((message + "\n").utf8))
+    exit(1)
+}
+
+guard CommandLine.arguments.count >= 3 else { fail("usage: variants <folder> <width>x<height>[@fps] …") }
 let folder = URL(fileURLWithPath: CommandLine.arguments[1])
 let master = folder.appendingPathComponent("Gargantua-7680x4800.mp4")
+guard FileManager.default.fileExists(atPath: master.path) else { fail("Missing \(master.path); make it with: make render") }
 let targets: [(Int, Int, Int?)] = CommandLine.arguments.dropFirst(2).compactMap {
     let parts = $0.split(separator: "@")
     let pair = parts[0].split(separator: "x")
@@ -14,27 +21,27 @@ let targets: [(Int, Int, Int?)] = CommandLine.arguments.dropFirst(2).compactMap 
     let rate = parts.count > 1 ? Int(parts[1]) : nil
     return (w, h, rate)
 }
-guard !targets.isEmpty else { fatalError("Give at least one size, e.g. 3072x1920 or 3072x1920@30") }
+guard !targets.isEmpty else { fail("Give at least one size, e.g. 3072x1920 or 3072x1920@30") }
 
-let device = MTLCreateSystemDefaultDevice()!
+guard let device = MTLCreateSystemDefaultDevice() else { fail("No Metal GPU was found.") }
 let ci = CIContext(mtlDevice: device, options: [.workingColorSpace: NSNull(), .cacheIntermediates: false])
 
 func encode(width: Int, height: Int, rate: Int?) async throws {
     let asset = AVURLAsset(url: master)
     guard let track = try await asset.loadTracks(withMediaType: .video).first else {
-        fatalError("The master has no video track")
+        fail("The master has no video track")
     }
     let source = try await track.load(.naturalSize)
     let frameRate = try await track.load(.nominalFrameRate)
     let sourceFps = Int(frameRate.rounded())
     let fps = rate ?? sourceFps
     guard fps > 0, fps <= sourceFps, sourceFps % fps == 0 else {
-        fatalError("\(fps) fps must divide the master's \(sourceFps) fps exactly")
+        fail("\(fps) fps must divide the master's \(sourceFps) fps exactly")
     }
     let stride = sourceFps / fps
     let scale = Double(width) / source.width
     guard abs(scale - Double(height) / source.height) < 0.001 else {
-        fatalError("\(width)x\(height): aspect ratio differs from the master \(source)")
+        fail("\(width)x\(height): aspect ratio differs from the master \(source)")
     }
 
     let reader = try AVAssetReader(asset: asset)
@@ -73,9 +80,9 @@ func encode(width: Int, height: Int, rate: Int?) async throws {
         kCVPixelBufferIOSurfacePropertiesKey as String: [:],
     ])
     writer.add(input)
-    guard writer.startWriting() else { fatalError("Writer: \(String(describing: writer.error))") }
+    guard writer.startWriting() else { fail("Writer: \(String(describing: writer.error))") }
     writer.startSession(atSourceTime: .zero)
-    guard reader.startReading() else { fatalError("Reader: \(String(describing: reader.error))") }
+    guard reader.startReading() else { fail("Reader: \(String(describing: reader.error))") }
 
     let lanczos = CIFilter.lanczosScaleTransform()
     lanczos.scale = Float(scale)
@@ -89,21 +96,21 @@ func encode(width: Int, height: Int, rate: Int?) async throws {
         sourceIndex += 1
         if sourceIndex % stride != 0 { continue }
         autoreleasepool {
-            guard let pixels = CMSampleBufferGetImageBuffer(sample) else { fatalError("Frame \(frames) has no image") }
+            guard let pixels = CMSampleBufferGetImageBuffer(sample) else { fail("Frame \(frames) has no image") }
             while !input.isReadyForMoreMediaData && writer.status == .writing { usleep(2000) }
-            guard writer.status == .writing else { fatalError("Writer: \(String(describing: writer.error))") }
+            guard writer.status == .writing else { fail("Writer: \(String(describing: writer.error))") }
 
             lanczos.inputImage = CIImage(cvPixelBuffer: pixels).clampedToExtent()
-            guard let scaled = lanczos.outputImage else { fatalError("Lanczos") }
+            guard let scaled = lanczos.outputImage else { fail("Lanczos") }
 
             var buffer: CVPixelBuffer?
             guard let pool = adaptor.pixelBufferPool,
                   CVPixelBufferPoolCreatePixelBuffer(nil, pool, &buffer) == kCVReturnSuccess,
-                  let destination = buffer else { fatalError("Pixel buffer pool") }
+                  let destination = buffer else { fail("Pixel buffer pool") }
             ci.render(scaled.cropped(to: crop), to: destination, bounds: crop, colorSpace: nil)
             let time = CMTime(value: Int64(frames), timescale: Int32(fps))
             guard adaptor.append(destination, withPresentationTime: time) else {
-                fatalError("Append: \(String(describing: writer.error))")
+                fail("Append: \(String(describing: writer.error))")
             }
             frames += 1
             if frames % 90 == 0 {
@@ -112,13 +119,13 @@ func encode(width: Int, height: Int, rate: Int?) async throws {
             }
         }
     }
-    guard reader.status == .completed else { fatalError("Reader: \(String(describing: reader.error))") }
+    guard reader.status == .completed else { fail("Reader: \(String(describing: reader.error))") }
     input.markAsFinished()
     await writer.finishWriting()
-    guard writer.status == .completed else { fatalError("Finish: \(String(describing: writer.error))") }
+    guard writer.status == .completed else { fail("Finish: \(String(describing: writer.error))") }
 
     let result = AVURLAsset(url: url)
-    let resultTrack = try await result.loadTracks(withMediaType: .video).first!
+    guard let resultTrack = try await result.loadTracks(withMediaType: .video).first else { fail("\(url.lastPathComponent) has no video track") }
     let size = try await resultTrack.load(.naturalSize)
     let duration = try await result.load(.duration)
     let generator = AVAssetImageGenerator(asset: result)

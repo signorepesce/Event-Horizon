@@ -203,12 +203,14 @@ bool wp_is_image_name(const char *name) {
     return name && has_extension(name, types);
 }
 
-static bool all_digits(const char *start, const char *end) {
-    if (start == end) return false;
+static int dimension(const char *start, const char *end) {
+    if (start >= end || end - start > 5) return -1;
+    int value = 0;
     for (const char *c = start; c < end; c++) {
-        if (!isdigit((unsigned char)*c)) return false;
+        if (!isdigit((unsigned char)*c)) return -1;
+        value = value * 10 + (*c - '0');
     }
-    return true;
+    return value > 0 && value <= WP_DIMENSION_MAX ? value : -1;
 }
 
 bool wp_tier_parse(const char *name, wp_tier *tier) {
@@ -223,11 +225,11 @@ bool wp_tier_parse(const char *name, wp_tier *tier) {
         while (dash < stop && *dash != '-') dash++;
         const char *x = part;
         while (x < dash && *x != 'x') x++;
-        if (x < dash && all_digits(part, x) && all_digits(x + 1, dash)) {
-            width = atoi(part);
-            height = atoi(x + 1);
-        } else if (dash - part > 3 && strncmp(dash - 3, "fps", 3) == 0 && all_digits(part, dash - 3)) {
-            fps = atoi(part);
+        if (x < dash && dimension(part, x) > 0 && dimension(x + 1, dash) > 0) {
+            width = dimension(part, x);
+            height = dimension(x + 1, dash);
+        } else if (dash - part > 3 && strncmp(dash - 3, "fps", 3) == 0 && dimension(part, dash - 3) > 0) {
+            fps = dimension(part, dash - 3);
         } else if (dash - part == 4 && strncmp(part, "crop", 4) == 0) {
             cropped = true;
         }
@@ -236,7 +238,7 @@ bool wp_tier_parse(const char *name, wp_tier *tier) {
     if (width <= 0 || height <= 0) return false;
     tier->width = width;
     tier->height = height;
-    tier->fps = fps > 0 ? fps : 30;
+    tier->fps = fps > 0 && fps <= 240 ? fps : 30;
     tier->cropped = cropped;
     return true;
 }
@@ -271,6 +273,7 @@ static bool same_size(const wp_tier *a, const wp_tier *b) {
 }
 
 int wp_pick_tier(const wp_tier *tiers, int count, double target_width, double target_height, double rate, wp_fit fit) {
+    if (!tiers || count <= 0) return -1;
     int best = -1, largest = -1;
     for (int i = 0; i < count; i++) {
         if (!tier_fits_view(&tiers[i], target_width, target_height, fit)) continue;
@@ -296,7 +299,8 @@ static int even_ceil(double value) {
 
 bool wp_fitted_tier(wp_tier source, double target_width, double target_height, wp_fit fit, wp_tier *out) {
     if (!out || source.cropped || source.width <= 0 || source.height <= 0 || source.fps <= 0) return false;
-    if (target_width < 16 || target_height < 16) return false;
+    if (!(target_width >= 16 && target_width <= WP_DIMENSION_MAX) ||
+        !(target_height >= 16 && target_height <= WP_DIMENSION_MAX)) return false;
     double scale = cover_scale(source.width, source.height, target_width, target_height, fit);
     if (scale > 1.0) return false;
     int width = even_ceil(fit == WP_FIT_FILL ? target_width : source.width * scale);
