@@ -35,7 +35,6 @@ enum { ID_PAUSE = 100, ID_COVERED, ID_CHOOSE, ID_BUILTIN, ID_SPEED, ID_BATTERY, 
 
 static const GUID power_saving_status = {0xE00958C0, 0xC213, 0x4ACE, {0xAC, 0x77, 0xFE, 0xCC, 0xED, 0x2E, 0xEE, 0xA5}};
 
-
 static struct {
     HINSTANCE instance;
     HWND control, host, worker, progman;
@@ -181,11 +180,9 @@ static void resolve_paths(void) {
         scan_tiers(data);
         if (app.tier_count > 0) wcscpy(app.data_dir, data);
     }
-    const wchar_t *subdirs[] = {L"", L"\\videos", L"\\share", L"\\..\\..\\media"};
-    for (int i = 0; i < 4 && app.tier_count == 0; i++) {
-        swprintf(data, MAX_PATH, L"%ls%ls", app.exe_dir, subdirs[i]);
-        scan_tiers(data);
-        if (app.tier_count > 0) wcscpy(app.data_dir, data);
+    if (app.tier_count == 0) {
+        scan_tiers(app.exe_dir);
+        if (app.tier_count > 0) wcscpy(app.data_dir, app.exe_dir);
     }
     scan_tiers(app.variants);
     swprintf(app.mpv_exe, MAX_PATH, L"%ls\\mpv.exe", app.exe_dir);
@@ -537,18 +534,27 @@ static void sync_system_wallpaper(void) {
     wchar_t *slash = wcsrchr(folder, L'\\');
     if (slash) *slash = 0;
     swprintf(shot, MAX_PATH, L"%ls\\event_horizon.jpg", folder);
-    char path[WP_PATH_MAX];
+    char path[WP_PATH_MAX], reply[512];
     to_utf8(shot, path, sizeof path);
+    DeleteFileW(shot);
     const char *argv[] = {"screenshot-to-file", path, "video"};
     char command[WP_MPV_COMMAND_MAX];
-    wp_mpv_command(command, sizeof command, 0, argv, 3);
-    if (!ipc_request(command, 0, NULL, 0)) return;
+    wp_mpv_command(command, sizeof command, 9, argv, 3);
+    ipc_request(command, 9, reply, sizeof reply);
     for (int i = 0; i < 20 && !file_exists(shot); i++) Sleep(50);
     if (file_exists(shot) && SystemParametersInfoW(SPI_SETDESKWALLPAPER, 0, shot, SPIF_UPDATEINIFILE | SPIF_SENDCHANGE))
         app.synced = key;
 }
 
 static void schedule(void);
+
+static void notify(const wchar_t *text) {
+    app.tray.uFlags |= NIF_INFO;
+    swprintf(app.tray.szInfoTitle, 64, L"%ls", NAME);
+    swprintf(app.tray.szInfo, 256, L"%ls", text);
+    Shell_NotifyIconW(NIM_MODIFY, &app.tray);
+    app.tray.uFlags &= ~(UINT)NIF_INFO;
+}
 
 static bool is_refused(const char *name) {
     for (int i = 0; i < app.refused_count; i++) {
@@ -839,7 +845,8 @@ static void show_menu(void) {
     AppendMenuW(menu, MF_STRING | (p->pause_when_covered ? MF_CHECKED : 0), ID_COVERED, L"Pause When Covered");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, ID_CHOOSE, L"Choose Video or Image…");
-    AppendMenuW(menu, MF_STRING | (app.config.content == WP_CONTENT_BUILTIN ? MF_CHECKED : 0), ID_BUILTIN, L"Use Built-in Gargantua");
+    UINT builtin = app.tier_count == 0 ? MF_GRAYED : app.config.content == WP_CONTENT_BUILTIN ? MF_CHECKED : 0;
+    AppendMenuW(menu, MF_STRING | builtin, ID_BUILTIN, L"Use Built-in Gargantua");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     swprintf(label, 64, L"Speed: %g×…", p->speed);
     AppendMenuW(menu, MF_STRING, ID_SPEED, label);
@@ -909,7 +916,15 @@ static LRESULT CALLBACK control_proc(HWND window, UINT message, WPARAM w, LPARAM
         if (w == TIMER_WAKE) {
             double t = now();
             if (!app.mpv || WaitForSingleObject(app.mpv, 0) == WAIT_OBJECT_0) {
-                if (app.mpv && now() - app.mpv_started < 3.0) app.retry_at = now() + RETRY_DELAY;
+                bool quick = app.mpv && now() - app.mpv_started < 3.0;
+                if (quick && app.config.content != WP_CONTENT_BUILTIN) {
+                    app.config.content = WP_CONTENT_BUILTIN;
+                    app.config.path[0] = 0;
+                    save_config();
+                    notify(L"That background cannot be played, so the built-in one is back.");
+                } else if (quick) {
+                    app.retry_at = now() + RETRY_DELAY;
+                }
                 if (app.mpv) CloseHandle(app.mpv);
                 app.mpv = NULL;
                 app.playing[0] = 0;
@@ -956,6 +971,13 @@ static LRESULT CALLBACK control_proc(HWND window, UINT message, WPARAM w, LPARAM
     default:
         if (message == taskbar_created && taskbar_created) {
             Shell_NotifyIconW(NIM_ADD, &app.tray);
+            stop_mpv();
+            if (app.host && IsWindow(app.host)) DestroyWindow(app.host);
+            app.host = NULL;
+            if (attach_to_desktop()) {
+                wp_surface_init(&app.surface);
+                apply_state();
+            }
             return 0;
         }
     }
@@ -977,10 +999,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR line, int show
     load_config();
     if (!app.mpv_exe[0]) {
         MessageBoxW(NULL, L"mpv.exe was not found. Place it next to this program or add it to PATH.", NAME, MB_ICONERROR);
-        return 1;
-    }
-    if (app.tier_count == 0 && app.config.content == WP_CONTENT_BUILTIN) {
-        MessageBoxW(NULL, L"No background videos were found next to this program.", NAME, MB_ICONERROR);
         return 1;
     }
     app.job = CreateJobObjectW(NULL, NULL);
@@ -1014,13 +1032,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR line, int show
     app.tray.uID = 1;
     app.tray.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     app.tray.uCallbackMessage = WM_TRAY;
-    wchar_t icon[MAX_PATH];
-    swprintf(icon, MAX_PATH, L"%ls\\icon.ico", app.exe_dir);
     app.tray.hIcon = (HICON)LoadImageW(instance, MAKEINTRESOURCEW(1), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
-    if (!app.tray.hIcon) app.tray.hIcon = (HICON)LoadImageW(NULL, icon, IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE);
     if (!app.tray.hIcon) app.tray.hIcon = LoadIconW(NULL, IDI_APPLICATION);
     wcscpy(app.tray.szTip, NAME);
     Shell_NotifyIconW(NIM_ADD, &app.tray);
+    if (app.tier_count == 0 && app.config.content == WP_CONTENT_BUILTIN)
+        notify(L"The built-in videos are missing. Choose a video or image from this menu.");
 
     wp_surface_init(&app.surface);
     app.rate = -1;
@@ -1039,7 +1056,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR line, int show
     stop_mpv();
     Shell_NotifyIconW(NIM_DELETE, &app.tray);
     if (app.host) DestroyWindow(app.host);
-    SystemParametersInfoW(SPI_SETDESKWALLPAPER, 0, NULL, SPIF_SENDCHANGE);
+    wchar_t picture[MAX_PATH] = L"";
+    if (SystemParametersInfoW(SPI_GETDESKWALLPAPER, MAX_PATH, picture, 0) && picture[0])
+        SystemParametersInfoW(SPI_SETDESKWALLPAPER, 0, picture, SPIF_SENDCHANGE);
     if (app.job) CloseHandle(app.job);
     ReleaseMutex(single);
     CoUninitialize();

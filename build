@@ -1,0 +1,277 @@
+#!/bin/sh
+set -eu
+cd "$(dirname "$0")"
+
+NAME="Event Horizon"
+BIN=event_horizon
+OUT=out
+RELEASE=https://github.com/signorepesce/Event-Horizon/releases/latest/download
+SIZES="1920x1200 3072x1920 3840x2400"
+CORE="core/wallpaper.c core/mpv.c"
+FLAGS="-std=c11 -O2"
+STRICT="$FLAGS -Wall -Wextra -Wpedantic -Werror -Wshadow -Wstrict-prototypes -Wmissing-prototypes -Wcast-qual -Wundef \
+-Wvla -Wformat=2 -Wconversion -Wunused-macros -Wnull-dereference -Wdouble-promotion"
+WINLIBS="-luser32 -lcomctl32 -lshell32 -ldwmapi -lwtsapi32 -lcomdlg32 -lole32 -ladvapi32 -lgdi32"
+LINUXLIBS="-lX11 -lXext -lXinerama -lm"
+ENCODE="--no-config --really-quiet --no-audio --of=mp4 --ofopts=use_editlist=0 --ovc=libx264"
+TAGS="bf=0,colorspace=bt709,color_primaries=bt709,color_trc=bt709"
+COLOR="out_color_matrix=bt709:out_range=tv,format=yuv420p"
+
+say() { printf '%s\n' "$*"; }
+fail() { printf 'build: %s\n' "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1; }
+
+usage() {
+    say "usage: ./build [install | windows | videos | render | check | clean]"
+    say "  ./build          the app for this computer, ready to run"
+    say "  ./build install  the same, installed and started"
+    say "  ./build windows  Windows x64 and arm64 folders, from any computer with zig"
+    say "  ./build videos   only the Gargantua videos: downloaded, or rendered here"
+    say "  ./build render   render the Gargantua videos here, on any computer"
+    say "  ./build check    every platform with all warnings as errors"
+    say "  ./build clean    remove $OUT/"
+}
+
+videos() {
+    for size in $SIZES; do
+        for rate in 30 60; do say "media/Gargantua-$size-${rate}fps.mp4"; done
+    done
+}
+
+missing_videos() {
+    count=0
+    for file in $(videos); do [ -f "$file" ] || count=$((count + 1)); done
+    say "$count"
+}
+
+gpu_videos() {
+    say "Rendering Gargantua on this Mac's GPU: about ten minutes, only once"
+    mkdir -p "$OUT"
+    if [ ! -f media/Gargantua-7680x4800.mp4 ]; then
+        swiftc -O render/Render.swift -o "$OUT/render" && "$OUT/render" media 7680 4800 24 || return 1
+    fi
+    swiftc -O render/Variants.swift -o "$OUT/variants" &&
+        "$OUT/variants" media 3840x2400 3072x1920 1920x1200 3840x2400@30 3072x1920@30 1920x1200@30
+}
+
+cpu_videos() {
+    cc=${CC:-cc}
+    need "$cc" || { say "Rendering needs a C compiler"; return 1; }
+    need mpv || { say "Rendering encodes with mpv: install it, then run ./build render"; return 1; }
+    mkdir -p "$OUT"
+    "$cc" $FLAGS -pthread render/gargantua.c -o "$OUT/gargantua" -lm || return 1
+    top=media/Gargantua-3840x2400-60fps.mp4
+    if [ ! -f "$top" ]; then
+        say "Rendering Gargantua on the CPU: about half an hour, only once"
+        rm -f "$OUT/render.failed"
+        { "$OUT/gargantua" 3840 2400 24 || : > "$OUT/render.failed"; } |
+            mpv $ENCODE --ovcopts="crf=16,preset=slow,g=120,$TAGS" "--vf=lavfi=[scale=$COLOR]" \
+                --demuxer=rawvideo --demuxer-rawvideo-w=3840 --demuxer-rawvideo-h=2400 \
+                --demuxer-rawvideo-mp-format=rgb24 --demuxer-rawvideo-fps=60 --o="$top.part" - || return 1
+        if [ -f "$OUT/render.failed" ]; then
+            rm -f "$OUT/render.failed" "$top.part"
+            return 1
+        fi
+        mv "$top.part" "$top"
+    fi
+    for file in $(videos); do
+        [ -f "$file" ] && continue
+        tier=${file#media/Gargantua-}
+        size=${tier%%-*}
+        rate=${tier#*-}
+        rate=${rate%fps.mp4}
+        step=
+        [ "$rate" = 30 ] && step="framestep=2,"
+        if mpv $ENCODE "$top" --ovcopts="crf=18,preset=medium,g=$((rate * 2)),$TAGS" \
+            "--vf=lavfi=[${step}scale=${size%x*}:${size#*x}:flags=lanczos:$COLOR]" --o="$file.part"; then
+            mv "$file.part" "$file"
+        else
+            rm -f "$file.part"
+            return 1
+        fi
+    done
+}
+
+render_videos() {
+    if [ "$(uname -s)" = Darwin ] && need swiftc; then gpu_videos; else cpu_videos; fi
+}
+
+get_videos() {
+    [ "$(missing_videos)" -eq 0 ] && return 0
+    if need curl; then
+        say "Downloading the Gargantua videos"
+        for file in $(videos); do
+            [ -f "$file" ] && continue
+            if curl -fsL --retry 2 -o "$file.part" "$RELEASE/${file#media/}"; then mv "$file.part" "$file"; else rm -f "$file.part"; fi
+        done
+    fi
+    [ "$(missing_videos)" -eq 0 ] && return 0
+    render_videos && [ "$(missing_videos)" -eq 0 ] && return 0
+    say "The Gargantua videos are missing: the app will start, and you can choose your own video or image."
+}
+
+place_videos() {
+    for file in $(videos); do
+        [ -f "$file" ] || continue
+        ln -f "$file" "$1/" 2>/dev/null || cp "$file" "$1/"
+    done
+}
+
+macos_app() {
+    need clang && need swiftc || fail "install the Xcode command line tools: xcode-select --install"
+    [ "$(sw_vers -productVersion | cut -d. -f1)" -ge 15 ] || fail "Event Horizon needs macOS 15 or later"
+    target="$(uname -m)-apple-macos15.0"
+    dir="$OUT/macos"
+    app="$dir/$NAME.app"
+    rm -rf "$app"
+    mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+    for source in $CORE; do
+        clang $FLAGS -target "$target" -c "$source" -o "$dir/$(basename "$source" .c).o"
+    done
+    swiftc -O -whole-module-optimization -target "$target" -import-objc-header core/mpv.h \
+        macos/main.swift "$dir/wallpaper.o" "$dir/mpv.o" -o "$app/Contents/MacOS/$BIN"
+    rm -f "$dir/wallpaper.o" "$dir/mpv.o"
+    place_videos "$app/Contents/Resources"
+    cp macos/MenuIcon.png "$app/Contents/Resources/"
+    icons="$dir/icon.iconset"
+    rm -rf "$icons"
+    mkdir "$icons"
+    for size in 16 32 128 256 512; do
+        sips -z $size $size media/icon.png --out "$icons/icon_${size}x${size}.png" >/dev/null
+        sips -z $((size * 2)) $((size * 2)) media/icon.png --out "$icons/icon_${size}x${size}@2x.png" >/dev/null
+    done
+    iconutil -c icns "$icons" -o "$app/Contents/Resources/$BIN.icns"
+    rm -rf "$icons"
+    cat > "$app/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDisplayName</key><string>$NAME</string>
+	<key>CFBundleExecutable</key><string>$BIN</string>
+	<key>CFBundleIdentifier</key><string>local.eventhorizon.wallpaper</string>
+	<key>CFBundleName</key><string>$NAME</string>
+	<key>CFBundleIconFile</key><string>$BIN</string>
+	<key>CFBundlePackageType</key><string>APPL</string>
+	<key>CFBundleShortVersionString</key><string>2.0</string>
+	<key>CFBundleVersion</key><string>2</string>
+	<key>LSMinimumSystemVersion</key><string>15.0</string>
+	<key>LSUIElement</key><true/>
+	<key>NSHighResolutionCapable</key><true/>
+</dict>
+</plist>
+PLIST
+    codesign --force --sign - --timestamp=none "$app" >/dev/null 2>&1 || say "Signing failed: macOS may ask before opening the app"
+    say "Ready: $app ($(du -sh "$app" | cut -f1))"
+}
+
+macos_install() {
+    pkill -x "$BIN" 2>/dev/null || true
+    rm -rf "/Applications/$NAME.app"
+    cp -R "$OUT/macos/$NAME.app" /Applications/
+    /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+        -f "/Applications/$NAME.app" >/dev/null 2>&1 || true
+    open "/Applications/$NAME.app"
+    say "Installed and started: /Applications/$NAME.app"
+}
+
+linux_hint() {
+    if need apt-get; then say "sudo apt-get install $1"
+    elif need dnf; then say "sudo dnf install $2"
+    elif need pacman; then say "sudo pacman -S $3"
+    elif need zypper; then say "sudo zypper install $2"
+    else say "install $1 with your package manager"
+    fi
+}
+
+linux_app() {
+    cc=${CC:-cc}
+    need "$cc" || fail "install a C compiler: $(linux_hint gcc gcc gcc)"
+    printf '#include <X11/Xlib.h>\n#include <X11/extensions/dpms.h>\nint main(void) { return 0; }\n' |
+        "$cc" -x c - -o /dev/null $LINUXLIBS 2>/dev/null ||
+        fail "install the X11 libraries: $(linux_hint "libx11-dev libxext-dev libxinerama-dev" \
+            "libX11-devel libXext-devel libXinerama-devel" "libx11 libxext libxinerama")"
+    mkdir -p "$OUT/linux"
+    "$cc" $FLAGS linux/main.c $CORE -o "$OUT/linux/$BIN" $LINUXLIBS
+    mkdir -p "$OUT/linux/share"
+    place_videos "$OUT/linux/share"
+    player=mpv
+    [ -n "${WAYLAND_DISPLAY:-}" ] && player=mpvpaper
+    need "$player" || say "To play, Event Horizon needs $player: $(linux_hint "$player" "$player" "$player")"
+    say "Ready: $OUT/linux/$BIN"
+}
+
+linux_install() {
+    mkdir -p "$HOME/.local/bin" "$HOME/.local/share/$BIN" "$HOME/.config/autostart"
+    "$HOME/.local/bin/$BIN" --quit 2>/dev/null || true
+    cp "$OUT/linux/$BIN" "$HOME/.local/bin/$BIN"
+    place_videos "$HOME/.local/share/$BIN"
+    printf '[Desktop Entry]\nType=Application\nName=%s\nExec=%s\nNoDisplay=true\nX-GNOME-Autostart-enabled=true\n' \
+        "$NAME" "$HOME/.local/bin/$BIN" > "$HOME/.config/autostart/$BIN.desktop"
+    nohup "$HOME/.local/bin/$BIN" >/dev/null 2>&1 &
+    say "Installed and started: $HOME/.local/bin/$BIN; it also opens at login"
+}
+
+windows_apps() {
+    need zig || fail "install zig (https://ziglang.org/download) to build for Windows"
+    for pair in x86_64:x64 aarch64:arm64; do
+        dir="$OUT/windows-${pair#*:}"
+        mkdir -p "$dir"
+        zig cc -target "${pair%%:*}-windows-gnu" $FLAGS -municode windows/main.c $CORE windows/app.rc \
+            -o "$dir/$BIN.exe" -Wl,--subsystem,windows $WINLIBS
+        rm -f "$dir/$BIN.pdb"
+        place_videos "$dir"
+        printf 'Put mpv.exe (https://mpv.io/installation) next to %s.exe, then run %s.exe.\r\n' "$BIN" "$BIN" > "$dir/README.txt"
+        say "Ready: $dir"
+    done
+}
+
+check() {
+    cc=${CC:-cc}
+    dir="$OUT/check"
+    mkdir -p "$dir"
+    for source in $CORE render/gargantua.c; do "$cc" $STRICT -c "$source" -o "$dir/$(basename "$source" .c).o"; done
+    say "core and renderer: clean"
+    if [ "$(uname -s)" = Darwin ]; then
+        swiftc -warnings-as-errors -typecheck -import-objc-header core/mpv.h macos/main.swift
+        for tool in Render Variants; do swiftc -warnings-as-errors -typecheck "render/$tool.swift"; done
+        say "macOS: clean"
+    fi
+    if [ "$(uname -s)" = Linux ]; then
+        "$cc" $STRICT -Wno-unused-parameter -c linux/main.c -o "$dir/linux.o"
+        say "Linux: clean"
+    elif need zig && [ -f /opt/homebrew/include/X11/Xlib.h ]; then
+        zig cc -target x86_64-linux-gnu $STRICT -Wno-unused-parameter -I/opt/homebrew/include -I/usr/include \
+            -c linux/main.c -o "$dir/linux.o"
+        zig cc -target x86_64-linux-gnu $STRICT -c render/gargantua.c -o "$dir/gargantua-linux.o"
+        say "Linux: clean"
+    else
+        say "Linux: skipped, no X11 headers here"
+    fi
+    if need zig; then
+        zig cc -target x86_64-windows-gnu $STRICT -Wno-unused-parameter -municode windows/main.c $CORE windows/app.rc \
+            -o "$dir/windows.exe" -Wl,--subsystem,windows $WINLIBS
+        zig cc -target x86_64-windows-gnu $STRICT -c render/gargantua.c -o "$dir/gargantua-windows.o"
+        say "Windows: clean"
+    else
+        say "Windows: skipped, no zig here"
+    fi
+    rm -rf "$dir"
+    rmdir "$OUT" 2>/dev/null || true
+}
+
+case "${1:-}" in
+    "" | install)
+        get_videos
+        case "$(uname -s)" in
+            Darwin) macos_app; if [ "${1:-}" = install ]; then macos_install; fi ;;
+            Linux) linux_app; if [ "${1:-}" = install ]; then linux_install; fi ;;
+            *) fail "on Windows run build.cmd; elsewhere, ./build windows" ;;
+        esac ;;
+    windows) get_videos; windows_apps ;;
+    videos) get_videos ;;
+    render) render_videos || fail "rendering stopped; run ./build render again to finish" ;;
+    check) check ;;
+    clean) rm -rf "$OUT" ;;
+    *) usage; exit 2 ;;
+esac

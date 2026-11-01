@@ -132,8 +132,14 @@ static void resolve_paths(void) {
     mkdir(app.variants_dir, 0755);
 
     const char *runtime = getenv("XDG_RUNTIME_DIR");
-    snprintf(app.runtime, sizeof app.runtime, "%s/%s", runtime && *runtime ? runtime : "/tmp", APP);
+    if (runtime && *runtime) snprintf(app.runtime, sizeof app.runtime, "%s/%s", runtime, APP);
+    else snprintf(app.runtime, sizeof app.runtime, "/tmp/%s-%u", APP, (unsigned)getuid());
     mkdir(app.runtime, 0700);
+    struct stat own;
+    if (lstat(app.runtime, &own) != 0 || !S_ISDIR(own.st_mode) || own.st_uid != getuid() || (own.st_mode & 077)) {
+        fprintf(stderr, "%s is not a private folder of this user; not using it\n", app.runtime);
+        exit(1);
+    }
     snprintf(app.socket_path, sizeof app.socket_path, "%s/mpv.sock", app.runtime);
 
     char exe[PATH_MAX] = {0};
@@ -141,12 +147,11 @@ static void resolve_paths(void) {
     char *slash = n > 0 ? strrchr(exe, '/') : NULL;
     if (slash) *slash = '\0';
     const char *env = getenv("EVENT_HORIZON_DATA");
-    char candidates[6][PATH_MAX];
+    char candidates[5][PATH_MAX];
     int count = 0;
     if (env && *env) snprintf(candidates[count++], PATH_MAX, "%s", env);
     if (slash) {
         snprintf(candidates[count++], PATH_MAX, "%s/share", exe);
-        snprintf(candidates[count++], PATH_MAX, "%s/../media", exe);
         snprintf(candidates[count++], PATH_MAX, "%s/../share/%s", exe, APP);
     }
     snprintf(candidates[count++], PATH_MAX, "%s/.local/share/%s", home ? home : ".", APP);
@@ -449,6 +454,11 @@ static void stop_mpv(void) {
     unlink(app.socket_path);
 }
 
+static void join_option(char *out, size_t size, const char *text) {
+    size_t used = strlen(out);
+    if (used + 1 < size) snprintf(out + used, size - used, "%s%s", used ? " " : "", text);
+}
+
 static void start_mpv(const char *path, bool image, double start) {
     stop_mpv();
     char source[PATH_MAX];
@@ -468,18 +478,11 @@ static void start_mpv(const char *path, bool image, double start) {
         for (int i = 0; i < options.count; i++) {
             const char *item = options.items[i];
             if (strncmp(item, "--wid=", 6) == 0 || strcmp(item, "--no-terminal") == 0) continue;
-            if (joined[0]) strcat(joined, " ");
-            strcat(joined, item + 2);
+            join_option(joined, sizeof joined, item + 2);
         }
-        if (image) strcat(joined, " image-display-duration=inf");
-        if (concat) {
-            strcat(joined, " ");
-            strcat(joined, format_option);
-        }
-        if (start_option[0]) {
-            strcat(joined, " ");
-            strcat(joined, start_option);
-        }
+        if (image) join_option(joined, sizeof joined, "image-display-duration=inf");
+        if (concat) join_option(joined, sizeof joined, format_option);
+        if (start_option[0]) join_option(joined, sizeof joined, start_option);
         argv[argc++] = "mpvpaper";
         argv[argc++] = "--auto-pause";
         argv[argc++] = "-o";
@@ -866,7 +869,10 @@ static pid_t running_instance(void) {
     snprintf(path, sizeof path, "%s/pid", app.runtime);
     if (!read_file(path, text, sizeof text)) return 0;
     pid_t pid = (pid_t)strtol(text, NULL, 10);
-    return pid > 0 && kill(pid, 0) == 0 ? pid : 0;
+    if (pid <= 0 || kill(pid, 0) != 0) return 0;
+    char name[32];
+    snprintf(path, sizeof path, "/proc/%d/comm", (int)pid);
+    return read_file(path, name, sizeof name) && strcmp(name, APP) == 0 ? pid : 0;
 }
 
 static int control(int argc, char **argv) {
@@ -965,9 +971,9 @@ int main(int argc, char **argv) {
 
     load_config();
     load_tiers();
-    if (app.tier_count == 0 && app.config.content == WP_CONTENT_BUILTIN) {
-        fprintf(stderr, "no videos found; set EVENT_HORIZON_DATA or install them to ~/.local/share/%s\n", APP);
-        return 1;
+    if (app.tier_count == 0) {
+        fprintf(stderr, "no built-in videos found (EVENT_HORIZON_DATA or ~/.local/share/%s); "
+                        "use %s --set FILE to show your own\n", APP, APP);
     }
     const char *wayland = getenv("WAYLAND_DISPLAY");
     app.wayland = wayland && *wayland;
@@ -1001,7 +1007,12 @@ int main(int argc, char **argv) {
         int status = 0;
         if (app.encoder > 0 && waitpid(app.encoder, &status, WNOHANG) == app.encoder) finish_encoder(status);
         if (app.mpv > 0 && waitpid(app.mpv, NULL, WNOHANG) == app.mpv) {
-            if (now() - app.mpv_started < 3.0) {
+            if (now() - app.mpv_started < 3.0 && app.config.content != WP_CONTENT_BUILTIN) {
+                fprintf(stderr, "%s cannot be played; back to the built-in background\n", app.config.path);
+                app.config.content = WP_CONTENT_BUILTIN;
+                app.config.path[0] = '\0';
+                save_config();
+            } else if (now() - app.mpv_started < 3.0) {
                 app.retry_at = now() + RETRY_DELAY;
                 fprintf(stderr, "%s exited right after starting; retrying in %.0f s\n", app.wayland ? "mpvpaper" : "mpv", RETRY_DELAY);
             }

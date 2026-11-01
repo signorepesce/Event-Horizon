@@ -1,4 +1,4 @@
-/build/
+/out/
 /media/*.mp4
 /media/archive/
 .DS_Store
