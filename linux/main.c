@@ -690,7 +690,7 @@ static bool x11_open(void) {
 
 static bool current_covered(void) {
     double t = now();
-    if (t - app.last_scan >= WP_COVERAGE_POLL - 0.05 || (app.scan_at >= 0 && t >= app.scan_at)) {
+    if (t - app.last_scan >= wp_coverage_poll(app.covered) - 0.05 || (app.scan_at >= 0 && t >= app.scan_at)) {
         app.covered = x11_covered();
         app.last_scan = t;
         app.scan_at = -1;
@@ -826,7 +826,7 @@ static void apply_state(void) {
     double rate = wp_rate(&app.config.prefs, &app.system);
     app.rate = rate;
     if (app.encoder > 0 && !wp_fitted_allowed(&app.system)) stop_encoder();
-    bool covered = !app.wayland && !wp_frozen(&app.system) && current_covered();
+    bool covered = app.config.prefs.pause_when_covered && !app.wayland && !wp_frozen(&app.system) && current_covered();
     wp_want want = wp_decide(&app.config.prefs, &app.system, covered);
     if (want == WP_WANT_PLAY && app.mpv <= 0 && now() < app.retry_at) want = WP_WANT_RELEASE;
     wp_action action = wp_surface_step(&app.surface, want, rate, now(), WP_RELEASE_DELAY);
@@ -854,8 +854,8 @@ static void apply_state(void) {
 static double next_wake(void) {
     double t = now();
     double next = app.last_power + POWER_POLL;
-    if (!app.wayland && (!wp_frozen(&app.system) || app.system.display_asleep)) {
-        next = wp_next_wake(t, next, app.last_scan + WP_COVERAGE_POLL);
+    if (!app.wayland && app.config.prefs.pause_when_covered && (!wp_frozen(&app.system) || app.system.display_asleep)) {
+        next = wp_next_wake(t, next, app.last_scan + wp_coverage_poll(app.covered));
         next = wp_next_wake(t, next, app.scan_at);
     }
     next = wp_next_wake(t, next, wp_surface_deadline(&app.surface, WP_RELEASE_DELAY));

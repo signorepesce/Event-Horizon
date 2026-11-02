@@ -165,6 +165,10 @@ bool wp_frozen(const wp_system *system) {
            system->session_inactive || system->hot;
 }
 
+double wp_coverage_poll(bool covered) {
+    return covered ? WP_REVEAL_POLL : WP_COVERAGE_POLL;
+}
+
 wp_want wp_decide(const wp_prefs *prefs, const wp_system *system, bool covered) {
     if (wp_frozen(system)) return WP_WANT_RELEASE;
     return covered && prefs->pause_when_covered ? WP_WANT_PAUSE : WP_WANT_PLAY;

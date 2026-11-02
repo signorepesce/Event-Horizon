@@ -491,7 +491,7 @@ static bool windows_covered(void) {
 
 static bool current_covered(void) {
     double t = now();
-    if (t - app.last_scan >= WP_COVERAGE_POLL - 0.05 || (app.scan_at >= 0 && t >= app.scan_at)) {
+    if (t - app.last_scan >= wp_coverage_poll(app.covered) - 0.05 || (app.scan_at >= 0 && t >= app.scan_at)) {
         app.covered = windows_covered();
         app.last_scan = t;
         app.scan_at = -1;
@@ -704,7 +704,7 @@ static void apply_state(void) {
     double rate = wp_rate(&app.config.prefs, &app.system);
     app.rate = rate;
     if (app.encoder && !wp_fitted_allowed(&app.system)) stop_encoder();
-    bool covered = !wp_frozen(&app.system) && current_covered();
+    bool covered = app.config.prefs.pause_when_covered && !wp_frozen(&app.system) && current_covered();
     wp_want want = wp_decide(&app.config.prefs, &app.system, covered);
     if (want == WP_WANT_PLAY && !app.mpv && now() < app.retry_at) want = WP_WANT_RELEASE;
     wp_action action = wp_surface_step(&app.surface, want, rate, now(), WP_RELEASE_DELAY);
@@ -735,15 +735,15 @@ static void apply_state(void) {
 static void schedule(void) {
     double t = now();
     double next = -1;
-    if (!wp_frozen(&app.system)) {
-        next = wp_next_wake(t, next, app.last_scan + WP_COVERAGE_POLL);
+    if (app.config.prefs.pause_when_covered && !wp_frozen(&app.system)) {
+        next = wp_next_wake(t, next, app.last_scan + wp_coverage_poll(app.covered));
         next = wp_next_wake(t, next, app.scan_at);
     }
     next = wp_next_wake(t, next, wp_surface_deadline(&app.surface, WP_RELEASE_DELAY));
     if (!app.mpv && app.retry_at > t) next = wp_next_wake(t, next, app.retry_at);
     if (app.fit_name[0] && !app.encoder) next = wp_next_wake(t, next, app.fit_due);
     KillTimer(app.control, TIMER_WAKE);
-    if (next >= 0) SetCoalescableTimer(app.control, TIMER_WAKE, (UINT)((next - t) * 1000.0) + 1, NULL, 1000);
+    if (next >= 0) SetCoalescableTimer(app.control, TIMER_WAKE, (UINT)((next - t) * 1000.0) + 1, NULL, app.covered ? 100 : 1000);
 }
 
 static void request_scan(void) {

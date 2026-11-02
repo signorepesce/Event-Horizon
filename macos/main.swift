@@ -53,6 +53,34 @@ enum Pref {
     static func set(_ key: String, _ value: Any?) { UserDefaults.standard.set(value, forKey: key) }
 }
 
+enum Login {
+    static let registered = "loginBuild"
+
+    static var build: String {
+        guard let url = Bundle.main.executableURL,
+              let info = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let date = info[.modificationDate] as? Date, let size = info[.size] as? Int else { return "" }
+        return "\(Int(date.timeIntervalSince1970))-\(size)"
+    }
+
+    static var enabled: Bool { SMAppService.mainApp.status == .enabled }
+
+    static func set(_ on: Bool) throws {
+        try? SMAppService.mainApp.unregister()
+        guard on else { return }
+        try SMAppService.mainApp.register()
+        Pref.set(registered, build)
+    }
+
+    static func refresh() {
+        let status = SMAppService.mainApp.status
+        log("login item: status \(status.rawValue)")
+        guard status != .notRegistered, status == .notFound || Pref.text(registered) != build else { return }
+        do { try set(true) } catch { log("login item: \(error.localizedDescription)") }
+        log("login item: renewed, status \(SMAppService.mainApp.status.rawValue)")
+    }
+}
+
 enum Media {
     static let imageTypes: Set<String> = ["jpg", "jpeg", "png", "heic", "heif", "tiff", "tif", "bmp", "gif", "webp"]
 }
@@ -626,6 +654,7 @@ final class Playback {
     private var generation = 0
     private var length = 0.0
     private var looperObserver: NSKeyValueObservation?
+    private var loop: (url: URL, asset: AVAsset)?
     var onFailure: ((Background) -> Void)?
 
     private let still: StillMaker
@@ -677,6 +706,7 @@ final class Playback {
 
     func clear() {
         teardown()
+        loop = nil
         background = nil
         length = 0
         stillImage = nil
@@ -802,10 +832,14 @@ final class Playback {
         guard let background else { return }
         if player != nil { teardown() }
         generation += 1
+        if let loop, loop.url == background.url {
+            return start(AVPlayerItem(asset: loop.asset), keepingPrevious: keepingPrevious)
+        }
         let mark = generation
         Task { @MainActor [weak self] in
             let asset = await Loop.asset(background.url)
             guard let self, self.generation == mark, self.background == background else { return }
+            self.loop = (background.url, asset)
             self.start(AVPlayerItem(asset: asset), keepingPrevious: keepingPrevious)
         }
     }
@@ -1125,6 +1159,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemV
     private var reconcileWork: DispatchWorkItem?
     private var lastWallpaperSignature = ""
     private var coalesced: DispatchWorkItem?
+    private var followUp: DispatchWorkItem?
     private var lastCheck = Date.distantPast
     private var lastFrozen: Bool?
     private let ownPID = ProcessInfo.processInfo.processIdentifier
@@ -1132,6 +1167,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemV
     func applicationDidFinishLaunching(_ notification: Notification) {
         Pref.register()
         retirePreviousInstances()
+        Login.refresh()
         try? FileManager.default.removeItem(at: Library.variantsFolder.appendingPathComponent("tmp", isDirectory: true))
 
         playback.onFailure = { [weak self] content in self?.contentFailed(content) }
@@ -1417,6 +1453,13 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemV
     }
 
     @objc private func layoutMayHaveChanged() {
+        followUp?.cancel()
+        let later = DispatchWorkItem { [weak self] in
+            self?.followUp = nil
+            self?.updatePlayback()
+        }
+        followUp = later
+        DispatchQueue.main.asyncAfter(deadline: .now() + WP_SETTLE_DELAY, execute: later)
         let since = Date().timeIntervalSince(lastCheck)
         guard since >= 0.3 else {
             guard coalesced == nil else { return }
@@ -1481,7 +1524,8 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemV
 
     private func scheduleWake(polling: Bool) {
         let now = uptime()
-        var next = polling ? now + WP_COVERAGE_POLL : -1
+        let covered = surfaces.values.contains { $0.covered }
+        var next = polling ? now + wp_coverage_poll(covered) : -1
         next = wp_next_wake(now, next, playback.releaseDeadline)
         next = wp_next_wake(now, next, playback.switchDeadline)
         wakeTimer?.invalidate()
@@ -1493,7 +1537,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemV
         }
         guard next >= 0 else { return }
         let timer = Timer(timeInterval: max(0.05, next - now), repeats: false) { [weak self] _ in self?.tick() }
-        timer.tolerance = polling ? 2 : 1
+        timer.tolerance = polling && covered ? 0.1 : polling ? 2 : 1
         RunLoop.main.add(timer, forMode: .common)
         wakeTimer = timer
     }
@@ -1547,15 +1591,9 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemV
         updatePlayback()
     }
 
-    private var opensAtLogin: Bool { SMAppService.mainApp.status == .enabled }
-
     @objc private func toggleLogin() {
         do {
-            if opensAtLogin {
-                try SMAppService.mainApp.unregister()
-            } else {
-                try SMAppService.mainApp.register()
-            }
+            try Login.set(!Login.enabled)
         } catch {
             let alert = NSAlert()
             alert.messageText = "The login item could not be changed."
@@ -1749,7 +1787,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemV
         prefItems.forEach { $0.state = Pref.flag($0.representedObject as? String ?? "") ? .on : .off }
         let custom = !builtIn
         contentItem?.state = custom || library.tiers.isEmpty ? .off : .on
-        loginItem?.state = opensAtLogin ? .on : .off
+        loginItem?.state = Login.enabled ? .on : .off
         let fit = Pref.text(Pref.fit)
         fitItems.forEach { $0.state = ($0.representedObject as? String) == fit ? .on : .off }
 

@@ -14,6 +14,8 @@
 #define WP_SLIDER_OCTAVES 2.0
 #define WP_SLIDER_SNAP 0.08
 #define WP_COVERAGE_POLL 5.0
+#define WP_REVEAL_POLL 1.0
+#define WP_SETTLE_DELAY 0.6
 #define WP_FITTED_SAVING 0.2
 #define WP_FITTED_LIMIT 6
 #define WP_FIT_DELAY 30.0
@@ -95,6 +97,7 @@ double wp_slider_position(double speed);
 
 double wp_rate(const wp_prefs *prefs, const wp_system *system);
 bool wp_frozen(const wp_system *system);
+double wp_coverage_poll(bool covered);
 wp_want wp_decide(const wp_prefs *prefs, const wp_system *system, bool covered);
 wp_want wp_want_merge(wp_want a, wp_want b);
 
