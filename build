@@ -4,6 +4,7 @@ cd "$(dirname "$0")"
 
 NAME="Event Horizon"
 BIN=event_horizon
+DMG=Event-Horizon.dmg
 OUT=out
 RELEASE=https://github.com/signorepesce/Event-Horizon/releases/latest/download
 SIZES="1920x1200 3072x1920 3840x2400"
@@ -22,9 +23,10 @@ fail() { printf 'build: %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1; }
 
 usage() {
-    say "usage: ./build [install | windows | videos | render | check | clean]"
+    say "usage: ./build [install | dmg | windows | videos | render | check | clean]"
     say "  ./build          the app for this computer, ready to run"
     say "  ./build install  the same, installed and started"
+    say "  ./build dmg      the Mac app in a disk image, for sharing"
     say "  ./build windows  Windows x64 and arm64 folders, from any computer with zig"
     say "  ./build videos   only the Gargantua videos: downloaded, or rendered here"
     say "  ./build render   render the Gargantua videos here, on any computer"
@@ -120,17 +122,19 @@ place_videos() {
 macos_app() {
     need clang && need swiftc || fail "install the Xcode command line tools: xcode-select --install"
     [ "$(sw_vers -productVersion | cut -d. -f1)" -ge 15 ] || fail "Event Horizon needs macOS 15 or later"
-    target="$(uname -m)-apple-macos15.0"
     dir="$OUT/macos"
     app="$dir/$NAME.app"
     rm -rf "$app"
     mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-    for source in $CORE; do
-        clang $FLAGS -target "$target" -c "$source" -o "$dir/$(basename "$source" .c).o"
+    for arch in arm64 x86_64; do
+        for source in $CORE; do
+            clang $FLAGS -target "$arch-apple-macos15.0" -c "$source" -o "$dir/$(basename "$source" .c).o"
+        done
+        swiftc -O -whole-module-optimization -target "$arch-apple-macos15.0" -import-objc-header core/mpv.h \
+            macos/main.swift "$dir/wallpaper.o" "$dir/mpv.o" -o "$dir/$BIN-$arch"
     done
-    swiftc -O -whole-module-optimization -target "$target" -import-objc-header core/mpv.h \
-        macos/main.swift "$dir/wallpaper.o" "$dir/mpv.o" -o "$app/Contents/MacOS/$BIN"
-    rm -f "$dir/wallpaper.o" "$dir/mpv.o"
+    lipo -create "$dir/$BIN-arm64" "$dir/$BIN-x86_64" -output "$app/Contents/MacOS/$BIN"
+    rm -f "$dir/wallpaper.o" "$dir/mpv.o" "$dir/$BIN-arm64" "$dir/$BIN-x86_64"
     place_videos "$app/Contents/Resources"
     cp macos/MenuIcon.png "$app/Contents/Resources/"
     icons="$dir/icon.iconset"
@@ -161,8 +165,43 @@ macos_app() {
 </dict>
 </plist>
 PLIST
-    codesign --force --sign - --timestamp=none "$app" >/dev/null 2>&1 || say "Signing failed: macOS may ask before opening the app"
+    macos_sign "$app" || say "Signing failed: macOS may ask before opening the app"
     say "Ready: $app ($(du -sh "$app" | cut -f1))"
+}
+
+developer_id() {
+    security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -n 1
+}
+
+macos_sign() {
+    identity=$(developer_id)
+    if [ -n "$identity" ]; then
+        codesign --force --options runtime --timestamp --sign "$identity" "$1"
+    else
+        codesign --force --sign - --timestamp=none "$1" >/dev/null 2>&1
+    fi
+}
+
+macos_dmg() {
+    dmg="$OUT/$DMG"
+    stage="$OUT/macos/disk"
+    rm -rf "$stage" "$dmg"
+    mkdir -p "$stage"
+    ditto "$OUT/macos/$NAME.app" "$stage/$NAME.app"
+    ln -s /Applications "$stage/Applications"
+    hdiutil create -quiet -volname "$NAME" -srcfolder "$stage" -fs HFS+ -format ULFO "$dmg"
+    rm -rf "$stage"
+    if [ -n "$(developer_id)" ]; then
+        macos_sign "$dmg"
+        if xcrun notarytool submit "$dmg" --keychain-profile "$BIN" --wait; then
+            xcrun stapler staple "$dmg"
+        else
+            say "Not notarized: run xcrun notarytool store-credentials $BIN once, then ./build dmg again"
+        fi
+    else
+        say "Signed ad hoc: without a Developer ID, macOS asks once before opening the app"
+    fi
+    say "Ready: $dmg ($(du -sh "$dmg" | cut -f1))"
 }
 
 macos_install() {
@@ -268,6 +307,11 @@ case "${1:-}" in
             Linux) linux_app; if [ "${1:-}" = install ]; then linux_install; fi ;;
             *) fail "on Windows run build.cmd; elsewhere, ./build windows" ;;
         esac ;;
+    dmg)
+        [ "$(uname -s)" = Darwin ] || fail "a disk image can only be made on a Mac"
+        get_videos
+        macos_app
+        macos_dmg ;;
     windows) get_videos; windows_apps ;;
     videos) get_videos ;;
     render) render_videos || fail "rendering stopped; run ./build render again to finish" ;;
