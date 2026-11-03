@@ -6,120 +6,96 @@ NAME="Event Horizon"
 BIN=event_horizon
 DMG=Event-Horizon.dmg
 OUT=out
+CACHE="$PWD/$OUT/cache"
+export ZIG_GLOBAL_CACHE_DIR="$CACHE/zig" ZIG_LOCAL_CACHE_DIR="$CACHE/zig"
 RELEASE=https://github.com/signorepesce/Event-Horizon/releases/latest/download
-SIZES="1920x1200 3072x1920 3840x2400"
+MASTER=media/Gargantua-7680x4800-120fps.mp4
 CORE="core/wallpaper.c core/mpv.c"
 FLAGS="-std=c11 -O2"
 STRICT="$FLAGS -Wall -Wextra -Wpedantic -Werror -Wshadow -Wstrict-prototypes -Wmissing-prototypes -Wcast-qual -Wundef \
 -Wvla -Wformat=2 -Wconversion -Wunused-macros -Wnull-dereference -Wdouble-promotion"
 WINLIBS="-luser32 -lcomctl32 -lshell32 -ldwmapi -lwtsapi32 -lcomdlg32 -lole32 -ladvapi32 -lgdi32"
 LINUXLIBS="-lX11 -lXext -lXinerama -lm"
-ENCODE="--no-config --really-quiet --no-audio --of=mp4 --ofopts=use_editlist=0 --ovc=libx264"
-TAGS="bf=0,colorspace=bt709,color_primaries=bt709,color_trc=bt709"
-COLOR="out_color_matrix=bt709:out_range=tv,format=yuv420p"
+ENCODE="--no-config --really-quiet --no-audio --of=mp4 --ofopts=use_editlist=0 --ovc=libx265"
+TAGS="bf=0,codec_tag=828601960,colorspace=bt709,color_primaries=bt709,color_trc=bt709"
+COLOR="out_color_matrix=bt709:out_range=tv,format=yuv420p10le"
 
 say() { printf '%s\n' "$*"; }
 fail() { printf 'build: %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1; }
 
 usage() {
-    say "usage: ./build [install | dmg | windows | videos | render | check | clean]"
+    say "usage: ./build [install | dmg | windows | video | render | check | clean]"
     say "  ./build          the app for this computer, ready to run"
     say "  ./build install  the same, installed and started"
     say "  ./build dmg      the Mac app in a disk image, for sharing"
     say "  ./build windows  Windows x64 and arm64 folders, from any computer with zig"
-    say "  ./build videos   only the Gargantua videos: downloaded, or rendered here"
-    say "  ./build render   render the Gargantua videos here, on any computer"
+    say "  ./build video    only the Gargantua video: downloaded, or rendered here"
+    say "  ./build render   render the Gargantua video here, on any computer"
     say "  ./build check    every platform with all warnings as errors"
     say "  ./build clean    remove $OUT/"
 }
 
-videos() {
-    for size in $SIZES; do
-        for rate in 30 60; do say "media/Gargantua-$size-${rate}fps.mp4"; done
-    done
-}
-
-missing_videos() {
-    count=0
-    for file in $(videos); do [ -f "$file" ] || count=$((count + 1)); done
-    say "$count"
-}
-
-gpu_videos() {
-    say "Rendering Gargantua on this Mac's GPU: about ten minutes, only once"
+gpu_video() {
+    say "Rendering Gargantua on this Mac's GPU: about forty minutes, only once"
     mkdir -p "$OUT"
-    if [ ! -f media/Gargantua-7680x4800.mp4 ]; then
-        swiftc -O render/Render.swift -o "$OUT/render" && "$OUT/render" media 7680 4800 24 || return 1
-    fi
-    swiftc -O render/Variants.swift -o "$OUT/variants" &&
-        "$OUT/variants" media 3840x2400 3072x1920 1920x1200 3840x2400@30 3072x1920@30 1920x1200@30
+    rm -f "$OUT/${MASTER#media/}"
+    swiftc -O -module-cache-path "$CACHE/swift" render/Render.swift -o "$OUT/render" && "$OUT/render" "$OUT" 7680 4800 24 &&
+        mv "$OUT/${MASTER#media/}" "$MASTER"
 }
 
-cpu_videos() {
+cpu_video() {
     cc=${CC:-cc}
     need "$cc" || { say "Rendering needs a C compiler"; return 1; }
     need mpv || { say "Rendering encodes with mpv: install it, then run ./build render"; return 1; }
     mkdir -p "$OUT"
     "$cc" $FLAGS -pthread render/gargantua.c -o "$OUT/gargantua" -lm || return 1
-    top=media/Gargantua-3840x2400-60fps.mp4
-    if [ ! -f "$top" ]; then
-        say "Rendering Gargantua on the CPU: about half an hour, only once"
-        rm -f "$OUT/render.failed"
-        { "$OUT/gargantua" 3840 2400 24 || : > "$OUT/render.failed"; } |
-            mpv $ENCODE --ovcopts="crf=16,preset=slow,g=120,$TAGS" "--vf=lavfi=[scale=$COLOR]" \
-                --demuxer=rawvideo --demuxer-rawvideo-w=3840 --demuxer-rawvideo-h=2400 \
-                --demuxer-rawvideo-mp-format=rgb24 --demuxer-rawvideo-fps=60 --o="$top.part" - || return 1
-        if [ -f "$OUT/render.failed" ]; then
-            rm -f "$OUT/render.failed" "$top.part"
-            return 1
-        fi
-        mv "$top.part" "$top"
+    say "Rendering Gargantua on the CPU: about half a day, only once"
+    rm -f "$OUT/render.failed"
+    { "$OUT/gargantua" 7680 4800 24 || : > "$OUT/render.failed"; } |
+        mpv $ENCODE --ovcopts="crf=16,preset=medium,g=240,$TAGS" "--vf=lavfi=[scale=$COLOR]" \
+            --demuxer=rawvideo --demuxer-rawvideo-w=7680 --demuxer-rawvideo-h=4800 \
+            --demuxer-rawvideo-mp-format=rgb48le --demuxer-rawvideo-fps=120 --o="$MASTER.part" - || return 1
+    if [ -f "$OUT/render.failed" ]; then
+        rm -f "$OUT/render.failed" "$MASTER.part"
+        return 1
     fi
-    for file in $(videos); do
-        [ -f "$file" ] && continue
-        tier=${file#media/Gargantua-}
-        size=${tier%%-*}
-        rate=${tier#*-}
-        rate=${rate%fps.mp4}
-        step=
-        [ "$rate" = 30 ] && step="framestep=2,"
-        if mpv $ENCODE "$top" --ovcopts="crf=18,preset=medium,g=$((rate * 2)),$TAGS" \
-            "--vf=lavfi=[${step}scale=${size%x*}:${size#*x}:flags=lanczos:$COLOR]" --o="$file.part"; then
-            mv "$file.part" "$file"
-        else
-            rm -f "$file.part"
-            return 1
-        fi
-    done
+    mv "$MASTER.part" "$MASTER"
 }
 
-render_videos() {
-    if [ "$(uname -s)" = Darwin ] && need swiftc; then gpu_videos; else cpu_videos; fi
+render_video() {
+    if [ "$(uname -s)" = Darwin ] && need swiftc; then gpu_video; else cpu_video; fi
 }
 
-get_videos() {
-    [ "$(missing_videos)" -eq 0 ] && return 0
+get_video() {
+    [ -f "$MASTER" ] && return 0
     if need curl; then
-        say "Downloading the Gargantua videos"
-        for file in $(videos); do
-            [ -f "$file" ] && continue
-            if curl -fsL --retry 2 -o "$file.part" "$RELEASE/${file#media/}"; then mv "$file.part" "$file"; else rm -f "$file.part"; fi
-        done
+        say "Downloading the Gargantua video"
+        if curl -fL --retry 2 --progress-bar -o "$MASTER.part" "$RELEASE/${MASTER#media/}"; then
+            mv "$MASTER.part" "$MASTER"
+        else
+            rm -f "$MASTER.part"
+        fi
     fi
-    [ "$(missing_videos)" -eq 0 ] && return 0
-    render_videos && [ "$(missing_videos)" -eq 0 ] && return 0
-    say "The Gargantua videos are missing: the app will start, and you can choose your own video or image."
+    [ -f "$MASTER" ] && return 0
+    render_video && [ -f "$MASTER" ] && return 0
+    say "The Gargantua video is missing: the app will start, and you can choose your own video or image."
 }
 
-place_videos() {
-    for file in $(videos); do
-        [ -f "$file" ] || continue
-        ln -f "$file" "$1/" 2>/dev/null || cp "$file" "$1/"
-    done
+place_video() {
+    rm -f "$1"/Gargantua-*.mp4
+    if [ -f "$MASTER" ]; then
+        ln -f "$MASTER" "$1/" 2>/dev/null || cp "$MASTER" "$1/"
+    fi
 }
 
 macos_app() {
+    DATA=
+    if [ "${1:-}" = local ]; then
+        mkdir -p "$OUT/data"
+        DATA="
+	<key>EventHorizonData</key><string>$(printf '%s' "$PWD/$OUT/data" | sed 's/&/\&amp;/g; s/</\&lt;/g')</string>"
+    fi
     need clang && need swiftc || fail "install the Xcode command line tools: xcode-select --install"
     [ "$(sw_vers -productVersion | cut -d. -f1)" -ge 15 ] || fail "Event Horizon needs macOS 15 or later"
     dir="$OUT/macos"
@@ -130,12 +106,12 @@ macos_app() {
         for source in $CORE; do
             clang $FLAGS -target "$arch-apple-macos15.0" -c "$source" -o "$dir/$(basename "$source" .c).o"
         done
-        swiftc -O -whole-module-optimization -target "$arch-apple-macos15.0" -import-objc-header core/mpv.h \
-            macos/main.swift "$dir/wallpaper.o" "$dir/mpv.o" -o "$dir/$BIN-$arch"
+        swiftc -O -whole-module-optimization -module-cache-path "$CACHE/swift" -target "$arch-apple-macos15.0" \
+            -import-objc-header core/mpv.h macos/main.swift "$dir/wallpaper.o" "$dir/mpv.o" -o "$dir/$BIN-$arch"
     done
     lipo -create "$dir/$BIN-arm64" "$dir/$BIN-x86_64" -output "$app/Contents/MacOS/$BIN"
     rm -f "$dir/wallpaper.o" "$dir/mpv.o" "$dir/$BIN-arm64" "$dir/$BIN-x86_64"
-    place_videos "$app/Contents/Resources"
+    place_video "$app/Contents/Resources"
     cp macos/MenuIcon.png "$app/Contents/Resources/"
     icons="$dir/icon.iconset"
     rm -rf "$icons"
@@ -160,7 +136,7 @@ macos_app() {
 	<key>CFBundleShortVersionString</key><string>2.0</string>
 	<key>CFBundleVersion</key><string>2</string>
 	<key>LSMinimumSystemVersion</key><string>15.0</string>
-	<key>LSUIElement</key><true/>
+	<key>LSUIElement</key><true/>$DATA
 	<key>NSHighResolutionCapable</key><true/>
 </dict>
 </plist>
@@ -232,8 +208,8 @@ linux_app() {
             "libX11-devel libXext-devel libXinerama-devel" "libx11 libxext libxinerama")"
     mkdir -p "$OUT/linux"
     "$cc" $FLAGS linux/main.c $CORE -o "$OUT/linux/$BIN" $LINUXLIBS
-    mkdir -p "$OUT/linux/share"
-    place_videos "$OUT/linux/share"
+    mkdir -p "$OUT/linux/share" "$OUT/linux/data"
+    place_video "$OUT/linux/share"
     player=mpv
     [ -n "${WAYLAND_DISPLAY:-}" ] && player=mpvpaper
     need "$player" || say "To play, Event Horizon needs $player: $(linux_hint "$player" "$player" "$player")"
@@ -244,7 +220,7 @@ linux_install() {
     mkdir -p "$HOME/.local/bin" "$HOME/.local/share/$BIN" "$HOME/.config/autostart"
     "$HOME/.local/bin/$BIN" --quit 2>/dev/null || true
     cp "$OUT/linux/$BIN" "$HOME/.local/bin/$BIN"
-    place_videos "$HOME/.local/share/$BIN"
+    place_video "$HOME/.local/share/$BIN"
     printf '[Desktop Entry]\nType=Application\nName=%s\nExec=%s\nNoDisplay=true\nX-GNOME-Autostart-enabled=true\n' \
         "$NAME" "$HOME/.local/bin/$BIN" > "$HOME/.config/autostart/$BIN.desktop"
     nohup "$HOME/.local/bin/$BIN" >/dev/null 2>&1 &
@@ -255,11 +231,11 @@ windows_apps() {
     need zig || fail "install zig (https://ziglang.org/download) to build for Windows"
     for pair in x86_64:x64 aarch64:arm64; do
         dir="$OUT/windows-${pair#*:}"
-        mkdir -p "$dir"
+        mkdir -p "$dir/data"
         zig cc -target "${pair%%:*}-windows-gnu" $FLAGS -municode windows/main.c $CORE windows/app.rc \
             -o "$dir/$BIN.exe" -Wl,--subsystem,windows $WINLIBS
         rm -f "$dir/$BIN.pdb"
-        place_videos "$dir"
+        place_video "$dir"
         printf 'Put mpv.exe (https://mpv.io/installation) next to %s.exe, then run %s.exe.\r\n' "$BIN" "$BIN" > "$dir/README.txt"
         say "Ready: $dir"
     done
@@ -272,8 +248,8 @@ check() {
     for source in $CORE render/gargantua.c; do "$cc" $STRICT -c "$source" -o "$dir/$(basename "$source" .c).o"; done
     say "core and renderer: clean"
     if [ "$(uname -s)" = Darwin ]; then
-        swiftc -warnings-as-errors -typecheck -import-objc-header core/mpv.h macos/main.swift
-        for tool in Render Variants; do swiftc -warnings-as-errors -typecheck "render/$tool.swift"; done
+        swiftc -warnings-as-errors -typecheck -module-cache-path "$CACHE/swift" -import-objc-header core/mpv.h macos/main.swift
+        swiftc -warnings-as-errors -typecheck -module-cache-path "$CACHE/swift" render/Render.swift
         say "macOS: clean"
     fi
     if [ "$(uname -s)" = Linux ]; then
@@ -301,20 +277,20 @@ check() {
 
 case "${1:-}" in
     "" | install)
-        get_videos
+        get_video
         case "$(uname -s)" in
-            Darwin) macos_app; if [ "${1:-}" = install ]; then macos_install; fi ;;
+            Darwin) macos_app local; if [ "${1:-}" = install ]; then macos_install; fi ;;
             Linux) linux_app; if [ "${1:-}" = install ]; then linux_install; fi ;;
             *) fail "on Windows run build.cmd; elsewhere, ./build windows" ;;
         esac ;;
     dmg)
         [ "$(uname -s)" = Darwin ] || fail "a disk image can only be made on a Mac"
-        get_videos
+        get_video
         macos_app
         macos_dmg ;;
-    windows) get_videos; windows_apps ;;
-    videos) get_videos ;;
-    render) render_videos || fail "rendering stopped; run ./build render again to finish" ;;
+    windows) get_video; windows_apps ;;
+    video) get_video ;;
+    render) render_video || fail "rendering stopped; run ./build render again" ;;
     check) check ;;
     clean) rm -rf "$OUT" ;;
     *) usage; exit 2 ;;

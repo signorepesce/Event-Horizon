@@ -112,20 +112,30 @@ static bool read_file(const char *path, char *out, size_t size) {
 
 static void resolve_paths(void) {
     const char *home = getenv("HOME");
+    char exe[PATH_MAX] = {0};
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    char *slash = n > 0 ? strrchr(exe, '/') : NULL;
+    if (slash) *slash = '\0';
+    char base[PATH_MAX], data[PATH_MAX];
+    struct stat folder;
+    snprintf(data, sizeof data, "%s/data", exe);
+    bool local = slash && stat(data, &folder) == 0 && S_ISDIR(folder.st_mode);
+
     const char *config = getenv("XDG_CONFIG_HOME");
-    char base[PATH_MAX];
-    if (config && *config) snprintf(base, sizeof base, "%s/%s", config, APP);
+    if (local) snprintf(base, sizeof base, "%s", data);
+    else if (config && *config) snprintf(base, sizeof base, "%s/%s", config, APP);
     else snprintf(base, sizeof base, "%s/.config/%s", home ? home : ".", APP);
     mkdir(base, 0755);
     snprintf(app.config_path, sizeof app.config_path, "%s/config", base);
 
     const char *cache = getenv("XDG_CACHE_HOME");
-    if (cache && *cache) snprintf(base, sizeof base, "%s/%s", cache, APP);
-    else snprintf(base, sizeof base, "%s/.cache/%s", home ? home : ".", APP);
-    if (!(cache && *cache)) {
+    if (local) snprintf(base, sizeof base, "%s", data);
+    else if (cache && *cache) snprintf(base, sizeof base, "%s/%s", cache, APP);
+    else {
         char parent[PATH_MAX];
         snprintf(parent, sizeof parent, "%s/.cache", home ? home : ".");
         mkdir(parent, 0755);
+        snprintf(base, sizeof base, "%s/%s", parent, APP);
     }
     mkdir(base, 0755);
     snprintf(app.variants_dir, sizeof app.variants_dir, "%s/variants", base);
@@ -142,10 +152,6 @@ static void resolve_paths(void) {
     }
     snprintf(app.socket_path, sizeof app.socket_path, "%s/mpv.sock", app.runtime);
 
-    char exe[PATH_MAX] = {0};
-    ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
-    char *slash = n > 0 ? strrchr(exe, '/') : NULL;
-    if (slash) *slash = '\0';
     const char *env = getenv("EVENT_HORIZON_DATA");
     char candidates[5][PATH_MAX];
     int count = 0;
@@ -186,9 +192,47 @@ static void scan_tiers(const char *folder) {
     closedir(dir);
 }
 
+static void forget_stale_variants(void) {
+    char stamp[1024] = "", seen[1024] = "", record[PATH_MAX];
+    for (int i = 0; i < app.tier_count; i++) {
+        struct stat info;
+        const char *slash = strrchr(app.tier_paths[i], '/');
+        size_t used = strlen(stamp);
+        if (stat(app.tier_paths[i], &info) == 0) {
+            snprintf(stamp + used, sizeof stamp - used, "%s %lld\n", slash ? slash + 1 : app.tier_paths[i],
+                     (long long)info.st_size);
+        }
+    }
+    if (!stamp[0]) return;
+    snprintf(record, sizeof record, "%s/source", app.variants_dir);
+    FILE *file = fopen(record, "r");
+    if (file) {
+        seen[fread(seen, 1, sizeof seen - 1, file)] = '\0';
+        fclose(file);
+    }
+    if (strcmp(seen, stamp) == 0) return;
+    DIR *dir = opendir(app.variants_dir);
+    if (dir) {
+        struct dirent *entry;
+        while ((entry = readdir(dir))) {
+            if (!wp_is_video_name(entry->d_name)) continue;
+            char path[PATH_MAX];
+            snprintf(path, sizeof path, "%s/%s", app.variants_dir, entry->d_name);
+            unlink(path);
+        }
+        closedir(dir);
+    }
+    file = fopen(record, "w");
+    if (file) {
+        fputs(stamp, file);
+        fclose(file);
+    }
+}
+
 static void load_tiers(void) {
     app.tier_count = 0;
     scan_tiers(app.data_dir);
+    forget_stale_variants();
     scan_tiers(app.variants_dir);
 }
 

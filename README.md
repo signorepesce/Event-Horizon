@@ -10,6 +10,10 @@ By default it shows Gargantua, Interstellar's gigantic black hole, whose disk of
 
 It moves only while it can be seen, and rests when it cannot.
 
+## Download
+
+[**Download for Mac**](https://github.com/signorepesce/Event-Horizon/releases/latest/download/Event-Horizon.dmg) — macOS 15 or later, Apple silicon or Intel. Drag it into Applications; the first time, allow it under System Settings → Privacy & Security → **Open Anyway**.
+
 ## Build
 
 ```bash

@@ -17,11 +17,12 @@
 #include <unistd.h>
 #endif
 
-#define MAX_W 3840
-#define MAX_H 2400
+#define MAX_W 7680
+#define MAX_H 4800
 #define MAX_THREADS 64
 #define SAMPLES 4
-#define FPS 60
+#define TAPS 12
+#define FPS 120
 #define TAU 6.28318530718f
 
 typedef struct { float x, y, z; } v3;
@@ -32,9 +33,9 @@ static float glow[MAX_W * MAX_H][3];
 static float quarter[(MAX_W / 4) * (MAX_H / 4)][3];
 static float bloom_a[(MAX_W / 4) * (MAX_H / 4)][3];
 static float bloom_b[(MAX_W / 4) * (MAX_H / 4)][3];
-static unsigned char frame[MAX_W * MAX_H * 3];
+static unsigned char frame[MAX_W * MAX_H * 6];
 static int width, height, small_w, small_h, threads = 1;
-static float phase;
+static float phase, step;
 static rows_fn current;
 static int current_rows;
 static atomic_int next_row;
@@ -51,6 +52,7 @@ static float fract(float x) { return x - floorf(x); }
 static float mixf(float a, float b, float t) { return a + (b - a) * t; }
 static float clampf(float x, float lo, float hi) { return x < lo ? lo : x > hi ? hi : x; }
 static float maxf(float a, float b) { return a > b ? a : b; }
+static float wrap(float a) { return atan2f(sinf(a), cosf(a)); }
 static float fifth(float r) { float r2 = r * r; return r2 * r2 * r; }
 
 static float smooth(float e0, float e1, float x) {
@@ -77,12 +79,12 @@ static float noise(v3 p) {
 }
 
 static float fbm(v3 p, float footprint) {
-    float value = 0.0f, amplitude = 0.53f;
+    float value = 0.0f, amplitude = 0.51f;
     for (int i = 0; i < 7; i++) {
         float visibility = 1.0f - smooth(0.20f, 0.85f, footprint);
         value += amplitude * (visibility > 0.0f ? mixf(0.5f, noise(p), visibility) : 0.5f);
         p = add(scale(p, 2.07f), v(13.1f, 7.3f, 5.2f));
-        amplitude *= 0.49f;
+        amplitude *= 0.54f;
         footprint *= 2.07f;
     }
     return value;
@@ -171,27 +173,63 @@ static float gas(float r, float angle, float turn, float footprint) {
     float fine = fbm(v(cosf(theta + 0.04f * curl_x) * r * 8.0f, sinf(theta + 0.04f * curl_x) * r * 8.0f, warped * 26.0f),
                      footprint * 30.0f);
     float micro = fbm(v(cosf(bent) * r * 18.0f, sinf(bent) * r * 18.0f, warped * 47.0f), footprint * 50.0f);
-    return 0.115f + n + 0.34f * swirl + 0.145f * fine + 0.035f * micro;
+    return 0.021f + n + 0.34f * swirl + 0.26f * fine + 0.10f * micro;
 }
 
-static float wrap(float a) { return atan2f(sinf(a), cosf(a)); }
-
-static void disk(const float *m, const float *mx, const float *my, float color[3]) {
-    float r = m[0];
+static void shade(float r, float angle, float turn, float footprint, float doppler, float color[3]) {
     float inner = smooth(3.0f, 3.35f, r), outer = 1.0f - smooth(9.0f, 13.4f, r);
     if (inner * outer <= 0.0f) return;
-    float ax = wrap(mx[1] - m[1]), ay = wrap(my[1] - m[1]);
-    float footprint = maxf(hypotf(mx[0] - r, r * ax), hypotf(my[0] - r, r * ay));
-    footprint = clampf(footprint, 0.0001f, 0.3f);
-    float t = 1.0f - smooth(3.0f, 7.5f, r);
-    float n = t <= 0.0f ? gas(r, m[1], phase, footprint)
-            : t >= 1.0f ? gas(r, m[1], phase * 2.0f, footprint)
-            : mixf(gas(r, m[1], phase, footprint), gas(r, m[1], phase * 2.0f, footprint), t);
-    float b = powf(3.0f / r, 2.5f) * inner * outer * n * n * n * 4.2f * m[2] * m[2];
+    float t = 1.0f - smooth(3.0f, 7.5f, r), n = 0.0f;
+    if (t < 1.0f) n += (1.0f - t) * gas(r, angle, turn, footprint);
+    if (t > 0.0f) n += t * gas(r, angle, turn * 2.0f, footprint);
+    float b = powf(3.0f / r, 2.5f) * inner * outer * n * n * n * 4.2f * doppler * doppler;
     float heat = clampf((6.0f - r) / 4.0f + 0.45f * n, 0.0f, 1.0f);
-    color[0] = b * m[3];
-    color[1] = mixf(0.06f, 0.58f, heat) * b * m[3];
-    color[2] = mixf(0.003f, 0.20f, heat) * b * m[3];
+    color[0] += b;
+    color[1] += mixf(0.06f, 0.58f, heat) * b;
+    color[2] += mixf(0.003f, 0.20f, heat) * b;
+}
+
+static void slope(int x, int y, int dx, int dy, const float *m, float out[2]) {
+    float shortest = -1.0f;
+    out[0] = out[1] = 0.0f;
+    for (int s = -1; s <= 1; s += 2) {
+        int qx = x + dx * s, qy = y + dy * s;
+        if (qx < 0 || qy < 0 || qx >= width || qy >= height) continue;
+        const float *n = lens[qy * width + qx];
+        if (n[0] <= 0.0f) continue;
+        float dr = (n[0] - m[0]) * (float)s, da = wrap(n[1] - m[1]) * (float)s, l = hypotf(dr, m[0] * da);
+        if (shortest < 0.0f || l < shortest) {
+            float k = l > 0.3f ? 0.3f / l : 1.0f;
+            out[0] = dr * k, out[1] = da * k, shortest = l;
+        }
+    }
+}
+
+static void disk(int x, int y, const float *m, float color[3]) {
+    float r = m[0], sa[2], sb[2];
+    slope(x, y, 1, 0, m, sa);
+    slope(x, y, 0, 1, m, sb);
+    float la = hypotf(sa[0], r * sa[1]), lb = hypotf(sb[0], r * sb[1]);
+    float lm = r * step * (2.0f - smooth(3.0f, 7.5f, r));
+    int na = 1, nb = 1, nm = 1;
+    for (int i = 0; i < TAPS; i++) {
+        int ga = na, gb = nb, gm = nm;
+        float ea = la / (float)na, eb = lb / (float)nb, em = lm / (float)nm;
+        if (ea >= eb && ea >= em) ga++;
+        else if (eb >= em) gb++;
+        else gm++;
+        if (ga * gb * gm > TAPS) break;
+        na = ga, nb = gb, nm = gm;
+    }
+    float footprint = clampf(maxf(maxf(la / (float)na, lb / (float)nb), lm / (float)nm), 0.0001f, 0.3f);
+    int count = na * nb * nm;
+    for (int k = 0; k < count; k++) {
+        float oa = ((float)(k % na) + 0.5f) / (float)na - 0.5f;
+        float ob = ((float)((k / na) % nb) + 0.5f) / (float)nb - 0.5f;
+        float om = ((float)(k / (na * nb)) + 0.5f) / (float)nm - 0.5f;
+        shade(r + oa * sa[0] + ob * sb[0], m[1] + oa * sa[1] + ob * sb[1], phase + om * step, footprint, m[2], color);
+    }
+    for (int c = 0; c < 3; c++) color[c] *= m[3] / (float)count;
 }
 
 static void star(const float *m, const float *nx, const float *ny, float color[3]) {
@@ -229,7 +267,7 @@ static void cloud_rows(int first, int last) {
             const float *m = lens[y * width + x], *nx = lens[y * width + beside], *ny = lens[below * width + x];
             float *color = glow[y * width + x];
             color[0] = color[1] = color[2] = 0.0f;
-            if (m[0] > 0.0f) disk(m, nx, ny, color);
+            if (m[0] > 0.0f) disk(x, y, m, color);
             else if (m[0] < -1.5f) star(m, nx, ny, color);
         }
     }
@@ -290,10 +328,15 @@ static void composite_rows(int first, int last) {
                 c[k] = 1.0f - expf(-(glow[y * width + x][k] + bloom[k] * 0.22f) * 1.25f);
                 c[k] = powf(maxf(c[k], 0.0f), 1.0f / 2.2f);
             }
-            float dither = (hash(v((float)x, (float)y, 71.0f)) - 0.5f) * (0.65f / 255.0f);
+            float dither = (hash(v((float)x, (float)y, 71.0f)) - 0.5f) * (0.65f / 1023.0f);
             dither *= smooth(0.002f, 0.015f, maxf(c[0], maxf(c[1], c[2])));
-            unsigned char *out = frame + ((size_t)y * (size_t)width + (size_t)x) * 3;
-            for (int k = 0; k < 3; k++) out[k] = (unsigned char)(clampf(c[k] + dither, 0.0f, 1.0f) * 255.0f + 0.5f);
+            unsigned char *out = frame + ((size_t)y * (size_t)width + (size_t)x) * 6;
+            for (int k = 0; k < 3; k++) {
+                unsigned level = (unsigned)(clampf(c[k] + dither, 0.0f, 1.0f) * 1023.0f + 0.5f);
+                unsigned wide = (level << 6) | (level >> 4);
+                out[k * 2] = (unsigned char)(wide & 0xff);
+                out[k * 2 + 1] = (unsigned char)(wide >> 8);
+            }
         }
     }
 }
@@ -360,7 +403,8 @@ int main(int argc, char **argv) {
     height = argc == 4 ? number(argv[2], 64, MAX_H) : -1;
     if (width < 0 || height < 0 || seconds < 0) {
         fprintf(stderr, "usage: gargantua <width up to %d> <height up to %d> <seconds>\n"
-                        "writes raw RGB frames at %d fps to standard output; 0 seconds writes one PPM picture\n",
+                        "writes raw 16-bit little-endian RGB frames at %d fps to standard output;\n"
+                        "0 seconds writes one 16-bit PPM picture\n",
                 MAX_W, MAX_H, FPS);
         return 2;
     }
@@ -374,15 +418,21 @@ int main(int argc, char **argv) {
     time_t start = time(NULL);
     fprintf(stderr, "Gargantua %dx%d on %d threads: bending light\n", width, height, threads);
     parallel(geometry_rows, height);
-    size_t bytes = (size_t)width * (size_t)height * 3;
+    size_t bytes = (size_t)width * (size_t)height * 6;
+    int frames = (seconds > 0 ? seconds : 24) * FPS;
+    step = TAU / (float)frames;
     if (seconds == 0) {
         render(0.0f);
-        printf("P6\n%d %d\n255\n", width, height);
+        for (size_t i = 0; i < bytes; i += 2) {
+            unsigned char low = frame[i];
+            frame[i] = frame[i + 1];
+            frame[i + 1] = low;
+        }
+        printf("P6\n%d %d\n65535\n", width, height);
         return fwrite(frame, 1, bytes, stdout) == bytes && fflush(stdout) == 0 ? 0 : 1;
     }
-    int frames = seconds * FPS;
     for (int i = 0; i < frames; i++) {
-        render((float)i / (float)frames * TAU);
+        render((float)i * step);
         if (fwrite(frame, 1, bytes, stdout) != bytes) {
             fprintf(stderr, "the encoder stopped reading\n");
             return 1;

@@ -329,7 +329,7 @@ int wp_loop_repeats(double duration) {
 }
 
 bool wp_fitted_allowed(const wp_system *system) {
-    return !system->on_battery && !system->low_power && !system->hot;
+    return !system->hot;
 }
 
 wp_rect wp_canvas(const wp_rect *screens, int count) {

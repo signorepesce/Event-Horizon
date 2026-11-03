@@ -1,6 +1,6 @@
 #include <metal_stdlib>
 using namespace metal;
-constant float PI = 3.14159265359;
+constant int TAPS = 12;
 float hash(float3 p) {
     p = fract(p*0.1031); p += dot(p,p.yzx+33.33); return fract((p.x+p.y)*p.z);
 }
@@ -9,11 +9,11 @@ float noise(float3 p) {
     return mix(mix(mix(hash(i),hash(i+float3(1,0,0)),f.x),mix(hash(i+float3(0,1,0)),hash(i+float3(1,1,0)),f.x),f.y),mix(mix(hash(i+float3(0,0,1)),hash(i+float3(1,0,1)),f.x),mix(hash(i+float3(0,1,1)),hash(i+1.0),f.x),f.y),f.z);
 }
 float fbm(float3 p,float footprint) {
-    float v=0.0,a=0.53;
+    float v=0.0,a=0.51;
     for(int i=0;i<7;i++){
         float visibility=1.0-smoothstep(0.20,0.85,footprint);
-        v+=a*mix(0.5,noise(p),visibility);
-        p=p*2.07+float3(13.1,7.3,5.2);a*=0.49;footprint*=2.07;
+        v+=a*(visibility>0.0?mix(0.5,noise(p),visibility):0.5);
+        p=p*2.07+float3(13.1,7.3,5.2);a*=0.54;footprint*=2.07;
     }
     return v;
 }
@@ -77,7 +77,31 @@ float gas(float r,float angle,float phase,float footprint) {
     float swirl=fbm(float3(cos(angleWarp)*r*3.0,sin(angleWarp)*r*3.0,warped*11.0),footprint*12.0);
     float fine=fbm(float3(cos(theta+0.04*curl.x)*r*8.0,sin(theta+0.04*curl.x)*r*8.0,warped*26.0),footprint*30.0);
     float micro=fbm(float3(cos(angleWarp)*r*18.0,sin(angleWarp)*r*18.0,warped*47.0),footprint*50.0);
-    return 0.115+1.0*n+0.34*swirl+0.145*fine+0.035*micro;
+    return 0.021+1.0*n+0.34*swirl+0.26*fine+0.10*micro;
+}
+float3 shade(float r,float angle,float phase,float footprint,float doppler) {
+    float inner=smoothstep(3.0,3.35,r),outer=1.0-smoothstep(9.0,13.4,r);
+    if(inner*outer<=0.0)return 0.0;
+    float w=1.0-smoothstep(3.0,7.5,r),n=0.0;
+    if(w<1.0)n+=(1.0-w)*gas(r,angle,phase,footprint);
+    if(w>0.0)n+=w*gas(r,angle,phase*2.0,footprint);
+    float b=pow(3.0/r,2.5)*inner*outer*pow(n,3.0)*4.2*doppler*doppler;
+    float heat=clamp((6.0-r)/4.0+0.45*n,0.0,1.0);
+    return mix(float3(1.0,0.06,0.003),float3(1.0,0.58,0.20),heat)*b;
+}
+float2 slope(texture2d<float,access::read> map,int2 at,int2 step,float4 m) {
+    int2 size=int2(map.get_width(),map.get_height());
+    float2 best=0.0;float shortest=-1.0;
+    for(int s=-1;s<=1;s+=2) {
+        int2 q=at+step*s;
+        if(any(q<0)||any(q>=size))continue;
+        float4 n=map.read(uint2(q));
+        if(n.x<=0.0)continue;
+        float2 d=float2(n.x-m.x,atan2(sin(n.y-m.y),cos(n.y-m.y)))*float(s);
+        float l=length(float2(d.x,m.x*d.y));
+        if(shortest<0.0||l<shortest){best=l>0.3?d*0.3/l:d;shortest=l;}
+    }
+    return best;
 }
 kernel void clouds(texture2d<float,access::read> map [[texture(0)]],texture2d<float,access::write> target [[texture(1)]],constant float4 &params [[buffer(0)]],uint2 gid [[thread_position_in_grid]]) {
     if(gid.x>=target.get_width()||gid.y>=target.get_height())return;
@@ -85,19 +109,24 @@ kernel void clouds(texture2d<float,access::read> map [[texture(0)]],texture2d<fl
     float3 color=0.0;
     if(m.x>0) {
         float r=m.x;
-        float4 mx=map.read(min(gid+uint2(1,0),uint2(map.get_width()-1,map.get_height()-1)));
-        float4 my=map.read(min(gid+uint2(0,1),uint2(map.get_width()-1,map.get_height()-1)));
-        float ax=atan2(sin(mx.y-m.y),cos(mx.y-m.y));
-        float ay=atan2(sin(my.y-m.y),cos(my.y-m.y));
-        float footprint=max(length(float2(mx.x-r,r*ax)),length(float2(my.x-r,r*ay)));
-        footprint=clamp(footprint,0.0001,0.3);
-        float inner=smoothstep(3.0,3.35,r),outer=1.0-smoothstep(9.0,13.4,r);
-        float n=mix(gas(r,m.y,params.x,footprint),gas(r,m.y,params.x*2.0,footprint),1.0-smoothstep(3.0,7.5,r));
-        float b=pow(3.0/r,2.5)*inner*outer*pow(n,3.0)*4.2;
-        b*=pow(m.z,2.0);
-        float heat=clamp((6.0-r)/4.0+0.45*n,0.0,1.0);
-        float3 cold=float3(1.0,0.06,0.003),hot=float3(1.0,0.58,0.20);
-        color=mix(cold,hot,heat)*b*m.w;
+        float2 sa=slope(map,int2(gid),int2(1,0),m),sb=slope(map,int2(gid),int2(0,1),m);
+        float la=length(float2(sa.x,r*sa.y)),lb=length(float2(sb.x,r*sb.y));
+        float lm=r*params.y*(2.0-smoothstep(3.0,7.5,r));
+        int3 n=int3(1);
+        for(int i=0;i<TAPS;i++) {
+            int3 g=n;
+            if(la/n.x>=lb/n.y&&la/n.x>=lm/n.z)g.x++;else if(lb/n.y>=lm/n.z)g.y++;else g.z++;
+            if(g.x*g.y*g.z>TAPS)break;
+            n=g;
+        }
+        float footprint=clamp(max(max(la/n.x,lb/n.y),lm/n.z),0.0001,0.3);
+        float3 sum=0.0;
+        for(int k=0;k<n.x*n.y*n.z;k++) {
+            float3 o=(float3(k%n.x,(k/n.x)%n.y,k/(n.x*n.y))+0.5)/float3(n)-0.5;
+            float2 d=o.x*sa+o.y*sb;
+            sum+=shade(r+d.x,m.y+d.y,params.x+o.z*params.y,footprint,m.z);
+        }
+        color=sum/float(n.x*n.y*n.z)*m.w;
     } else if(m.x<-1.5) {
         float3 d=normalize(m.yzw);
         float4 nx=map.read(min(gid+uint2(1,0),uint2(map.get_width()-1,map.get_height()-1)));
@@ -150,7 +179,7 @@ kernel void composite(texture2d<float,access::read> source [[texture(0)]],textur
     float3 c=source.read(gid).rgb+bloom.sample(s,uv).rgb*0.22;
     c=1.0-exp(-c*1.25);
     c=pow(max(c,0.0),float3(1.0/2.2));
-    float dither=(hash(float3(float2(gid),71.0))-0.5)*(0.65/255.0);
+    float dither=(hash(float3(float2(gid),71.0))-0.5)*(0.65/1023.0);
     c=clamp(c+dither*smoothstep(0.002,0.015,max(c.r,max(c.g,c.b))),0.0,1.0);
     target.write(float4(c,1),gid);
 }

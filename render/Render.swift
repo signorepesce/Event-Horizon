@@ -3,6 +3,7 @@ import Metal
 import CoreVideo
 import CoreImage
 import AVFoundation
+import VideoToolbox
 
 func fail(_ message: String) -> Never {
     FileHandle.standardError.write(Data((message + "\n").utf8))
@@ -15,7 +16,7 @@ guard arguments.count == 5, let width = Int(arguments[2]), let height = Int(argu
     fail("usage: render <folder> <width> <height> <seconds>")
 }
 let folder = URL(fileURLWithPath: arguments[1])
-let fps = 60
+let fps = 120
 guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else { fail("No Metal GPU was found.") }
 print("GPU: \(device.name); \(width)×\(height)")
 let shader = try String(contentsOf: URL(fileURLWithPath: #filePath).deletingLastPathComponent()
@@ -55,20 +56,21 @@ if let error = setup.error { fail("Geometry: \(error)") }
 print("Lensing map ready")
 var cache: CVMetalTextureCache?
 CVMetalTextureCacheCreate(nil,nil,device,nil,&cache)
-let attributes: [String:Any] = [kCVPixelBufferPixelFormatTypeKey as String:kCVPixelFormatType_32BGRA,kCVPixelBufferWidthKey as String:width,kCVPixelBufferHeightKey as String:height,kCVPixelBufferMetalCompatibilityKey as String:true,kCVPixelBufferIOSurfacePropertiesKey as String:[:]]
+let attributes: [String:Any] = [kCVPixelBufferPixelFormatTypeKey as String:kCVPixelFormatType_ARGB2101010LEPacked,kCVPixelBufferWidthKey as String:width,kCVPixelBufferHeightKey as String:height,kCVPixelBufferMetalCompatibilityKey as String:true,kCVPixelBufferIOSurfacePropertiesKey as String:[:]]
 var pool: CVPixelBufferPool?
 CVPixelBufferPoolCreate(nil,nil,attributes as CFDictionary,&pool)
 let context = CIContext(mtlDevice:device)
 let cs = CGColorSpace(name:CGColorSpace.sRGB)!
+let step = 2*Float.pi/Float((seconds > 0 ? seconds : 24)*fps)
 func render(_ phase: Float, save: String? = nil) -> CVPixelBuffer {
     var pixel: CVPixelBuffer?
     CVPixelBufferPoolCreatePixelBuffer(nil,pool!,&pixel)
     let buffer = pixel!
     var cvt: CVMetalTexture?
-    CVMetalTextureCacheCreateTextureFromImage(nil,cache!,buffer,nil,.bgra8Unorm,width,height,0,&cvt)
+    CVMetalTextureCacheCreateTextureFromImage(nil,cache!,buffer,nil,.bgr10a2Unorm,width,height,0,&cvt)
     let target = CVMetalTextureGetTexture(cvt!)!
     let cb = queue.makeCommandBuffer()!
-    encode(cb,clouds,[map,radiance],width,height,SIMD4(phase,0,0,0))
+    encode(cb,clouds,[map,radiance],width,height,SIMD4(phase,step,0,0))
     encode(cb,downsample,[radiance,small],width/4,height/4,SIMD4(0,0,0,0))
     encode(cb,blur,[small,bloomA],width/4,height/4,SIMD4(1,0,0,0))
     encode(cb,blur,[bloomA,bloomB],width/4,height/4,SIMD4(0,1,0,0))
@@ -86,9 +88,9 @@ if seconds == 0 {
     print("Three preview frames saved")
     exit(0)
 }
-let output = folder.appendingPathComponent("Gargantua-\(width)x\(height).mp4")
+let output = folder.appendingPathComponent("Gargantua-\(width)x\(height)-\(fps)fps.mp4")
 let writer = try AVAssetWriter(outputURL:output,fileType:.mp4)
-let input = AVAssetWriterInput(mediaType:.video,outputSettings:[AVVideoCodecKey:AVVideoCodecType.hevc,AVVideoWidthKey:width,AVVideoHeightKey:height,AVVideoCompressionPropertiesKey:[AVVideoAverageBitRateKey:min(180_000_000,width*height*6),AVVideoMaxKeyFrameIntervalKey:fps*2,AVVideoExpectedSourceFrameRateKey:fps],AVVideoColorPropertiesKey:[AVVideoColorPrimariesKey:AVVideoColorPrimaries_ITU_R_709_2,AVVideoTransferFunctionKey:AVVideoTransferFunction_ITU_R_709_2,AVVideoYCbCrMatrixKey:AVVideoYCbCrMatrix_ITU_R_709_2]])
+let input = AVAssetWriterInput(mediaType:.video,outputSettings:[AVVideoCodecKey:AVVideoCodecType.hevc,AVVideoWidthKey:width,AVVideoHeightKey:height,AVVideoCompressionPropertiesKey:[AVVideoProfileLevelKey:kVTProfileLevel_HEVC_Main10_AutoLevel as String,AVVideoAverageBitRateKey:min(160_000_000,width*height*fps/2),AVVideoMaxKeyFrameIntervalKey:fps*2,AVVideoExpectedSourceFrameRateKey:fps],AVVideoColorPropertiesKey:[AVVideoColorPrimariesKey:AVVideoColorPrimaries_ITU_R_709_2,AVVideoTransferFunctionKey:AVVideoTransferFunction_ITU_R_709_2,AVVideoYCbCrMatrixKey:AVVideoYCbCrMatrix_ITU_R_709_2]])
 input.expectsMediaDataInRealTime = false
 let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput:input,sourcePixelBufferAttributes:attributes)
 writer.add(input)
@@ -99,10 +101,10 @@ for frame in 0..<(seconds*fps) {
     autoreleasepool {
         while !input.isReadyForMoreMediaData && writer.status == .writing { Thread.sleep(forTimeInterval:0.005) }
         guard writer.status == .writing else { fail("Writer: \(String(describing:writer.error))") }
-        let pixel = render(Float(frame)/Float(seconds*fps)*2*Float.pi,save:frame == 0 ? "Gargantua-\(width)x\(height).png" : nil)
+        let pixel = render(Float(frame)*step)
         guard adaptor.append(pixel,withPresentationTime:CMTime(value:Int64(frame),timescale:Int32(fps))) else { fail("Append: \(String(describing:writer.error))") }
     }
-    if frame % 60 == 0 { print("Frame \(frame)/\(seconds*fps), elapsed \(Int(Date().timeIntervalSince(start)))s"); fflush(stdout) }
+    if frame % fps == 0 { print("Frame \(frame)/\(seconds*fps), elapsed \(Int(Date().timeIntervalSince(start)))s"); fflush(stdout) }
 }
 input.markAsFinished()
 let done = DispatchSemaphore(value:0)

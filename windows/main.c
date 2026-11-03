@@ -144,9 +144,49 @@ static void scan_tiers(const wchar_t *dir) {
     FindClose(find);
 }
 
+static void forget_stale_variants(void) {
+    char stamp[1024] = "", seen[1024] = "";
+    for (int i = 0; i < app.tier_count; i++) {
+        wchar_t wide[MAX_PATH];
+        WIN32_FILE_ATTRIBUTE_DATA info;
+        const char *slash = strrchr(app.tier_paths[i], '\\');
+        size_t used = strlen(stamp);
+        to_wide(app.tier_paths[i], wide, MAX_PATH);
+        if (GetFileAttributesExW(wide, GetFileExInfoStandard, &info)) {
+            snprintf(stamp + used, sizeof stamp - used, "%s %lu %lu\n", slash ? slash + 1 : app.tier_paths[i],
+                     info.nFileSizeHigh, info.nFileSizeLow);
+        }
+    }
+    if (!stamp[0]) return;
+    wchar_t record[MAX_PATH], pattern[MAX_PATH], path[MAX_PATH];
+    swprintf(record, MAX_PATH, L"%ls\\source", app.variants);
+    FILE *file = _wfopen(record, L"rb");
+    if (file) {
+        seen[fread(seen, 1, sizeof seen - 1, file)] = '\0';
+        fclose(file);
+    }
+    if (strcmp(seen, stamp) == 0) return;
+    swprintf(pattern, MAX_PATH, L"%ls\\*.mp4", app.variants);
+    WIN32_FIND_DATAW entry;
+    HANDLE find = FindFirstFileW(pattern, &entry);
+    if (find != INVALID_HANDLE_VALUE) {
+        do {
+            swprintf(path, MAX_PATH, L"%ls\\%ls", app.variants, entry.cFileName);
+            DeleteFileW(path);
+        } while (FindNextFileW(find, &entry));
+        FindClose(find);
+    }
+    file = _wfopen(record, L"wb");
+    if (file) {
+        fputs(stamp, file);
+        fclose(file);
+    }
+}
+
 static void load_tiers(void) {
     app.tier_count = 0;
     if (app.data_dir[0]) scan_tiers(app.data_dir);
+    forget_stale_variants();
     scan_tiers(app.variants);
 }
 
@@ -161,18 +201,25 @@ static void resolve_paths(void) {
     GetModuleFileNameW(NULL, app.exe_dir, MAX_PATH);
     wchar_t *slash = wcsrchr(app.exe_dir, L'\\');
     if (slash) *slash = 0;
-    wchar_t appdata[MAX_PATH];
+    wchar_t beside[MAX_PATH], appdata[MAX_PATH], local[MAX_PATH];
+    swprintf(beside, MAX_PATH, L"%ls\\data", app.exe_dir);
+    DWORD attributes = GetFileAttributesW(beside);
+    bool portable = attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY);
     if (!GetEnvironmentVariableW(L"APPDATA", appdata, MAX_PATH)) wcscpy(appdata, app.exe_dir);
-    swprintf(app.folder, MAX_PATH, L"%ls\\%ls", appdata, APP);
+    if (portable) wcscpy(app.folder, beside);
+    else swprintf(app.folder, MAX_PATH, L"%ls\\%ls", appdata, APP);
     CreateDirectoryW(app.folder, NULL);
     swprintf(app.config_path, MAX_PATH, L"%ls\\config", app.folder);
     swprintf(app.pipe, 128, L"\\\\.\\pipe\\%ls_mpv_%lu", APP, GetCurrentProcessId());
 
-    wchar_t local[MAX_PATH];
     if (!GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH)) wcscpy(local, appdata);
-    swprintf(app.variants, MAX_PATH, L"%ls\\%ls", local, APP);
-    CreateDirectoryW(app.variants, NULL);
-    swprintf(app.variants, MAX_PATH, L"%ls\\%ls\\variants", local, APP);
+    if (portable) {
+        swprintf(app.variants, MAX_PATH, L"%ls\\variants", beside);
+    } else {
+        swprintf(app.variants, MAX_PATH, L"%ls\\%ls", local, APP);
+        CreateDirectoryW(app.variants, NULL);
+        swprintf(app.variants, MAX_PATH, L"%ls\\%ls\\variants", local, APP);
+    }
     CreateDirectoryW(app.variants, NULL);
 
     wchar_t data[MAX_PATH];
@@ -184,6 +231,7 @@ static void resolve_paths(void) {
         scan_tiers(app.exe_dir);
         if (app.tier_count > 0) wcscpy(app.data_dir, app.exe_dir);
     }
+    forget_stale_variants();
     scan_tiers(app.variants);
     swprintf(app.mpv_exe, MAX_PATH, L"%ls\\mpv.exe", app.exe_dir);
     if (!file_exists(app.mpv_exe) && !SearchPathW(NULL, L"mpv.exe", NULL, MAX_PATH, app.mpv_exe, NULL)) app.mpv_exe[0] = 0;

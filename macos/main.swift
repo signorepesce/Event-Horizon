@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import VideoToolbox
 import ServiceManagement
 import CoreImage
 import CoreImage.CIFilterBuiltins
@@ -14,10 +15,18 @@ func log(_ message: @autoclosure () -> String) {
 }
 
 func supportFolder() -> URL {
-    let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+    let manager = FileManager.default
+    if let path = Bundle.main.object(forInfoDictionaryKey: "EventHorizonData") as? String {
+        let local = URL(fileURLWithPath: path, isDirectory: true)
+        if manager.fileExists(atPath: local.deletingLastPathComponent().path) {
+            try? manager.createDirectory(at: local, withIntermediateDirectories: false)
+            if manager.isWritableFile(atPath: local.path) { return local }
+        }
+    }
+    let root = manager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
         ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support", isDirectory: true)
     let base = root.appendingPathComponent("Event Horizon", isDirectory: true)
-    try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+    try? manager.createDirectory(at: base, withIntermediateDirectories: true)
     return base
 }
 
@@ -142,6 +151,19 @@ struct Library {
         return folder
     }
 
+    static func forgetStale(made sources: [URL]) {
+        let manager = FileManager.default
+        let stamp = sources.filter { var tier = wp_tier(); return wp_tier_parse($0.path, &tier) }
+            .map { "\($0.lastPathComponent) \((try? manager.attributesOfItem(atPath: $0.path)[.size] as? Int) ?? 0)\n" }
+            .sorted().joined()
+        let record = variantsFolder.appendingPathComponent("source")
+        guard !stamp.isEmpty, (try? String(contentsOf: record, encoding: .utf8)) != stamp else { return }
+        for file in (try? manager.contentsOfDirectory(at: variantsFolder, includingPropertiesForKeys: nil)) ?? [] {
+            try? manager.removeItem(at: file)
+        }
+        try? stamp.write(to: record, atomically: true, encoding: .utf8)
+    }
+
     static func name(for tier: wp_tier) -> String? {
         var buffer = [CChar](repeating: 0, count: 128)
         guard wp_tier_name(WP_SCENE, tier, &buffer, buffer.count) > 0 else { return nil }
@@ -153,6 +175,7 @@ struct Library {
         let bundled = Bundle.main.resourceURL.flatMap {
             try? manager.contentsOfDirectory(at: $0, includingPropertiesForKeys: nil)
         } ?? []
+        forgetStale(made: bundled)
         let fitted = (try? manager.contentsOfDirectory(at: variantsFolder, includingPropertiesForKeys: nil)) ?? []
         let files = bundled + fitted
         var urls: [URL] = []
@@ -305,10 +328,10 @@ enum Transcoder {
             throw Failure("The video has no usable picture size.")
         }
 
-        let fps = info.fps.isFinite && info.fps >= 1 ? min(60, Int(info.fps.rounded())) : 30
+        let fps = info.fps.isFinite && info.fps >= 1 ? min(120, Int(info.fps.rounded())) : 30
         let reader = try AVAssetReader(asset: asset)
         let readerOutput = AVAssetReaderTrackOutput(track: info.track, outputSettings: [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
             kCVPixelBufferMetalCompatibilityKey as String: true,
             kCVPixelBufferIOSurfacePropertiesKey as String: [:],
         ])
@@ -322,7 +345,8 @@ enum Transcoder {
             AVVideoWidthKey: Int(target.width),
             AVVideoHeightKey: Int(target.height),
             AVVideoCompressionPropertiesKey: [
-                AVVideoAverageBitRateKey: Int(target.width * target.height * CGFloat(fps) * 0.04),
+                AVVideoProfileLevelKey: kVTProfileLevel_HEVC_Main10_AutoLevel as String,
+                AVVideoQualityKey: 0.65,
                 AVVideoMaxKeyFrameIntervalKey: fps * 2,
                 AVVideoExpectedSourceFrameRateKey: fps,
             ],
@@ -334,7 +358,7 @@ enum Transcoder {
         ])
         input.expectsMediaDataInRealTime = false
         let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_ARGB2101010LEPacked,
             kCVPixelBufferWidthKey as String: Int(target.width),
             kCVPixelBufferHeightKey as String: Int(target.height),
             kCVPixelBufferMetalCompatibilityKey as String: true,
@@ -358,6 +382,7 @@ enum Transcoder {
                 guard let pixels = CMSampleBufferGetImageBuffer(sample) else {
                     throw Failure("A frame could not be decoded.")
                 }
+                guard CMSampleBufferGetPresentationTimeStamp(sample).seconds * Double(fps) + 0.501 >= Double(frames) else { return }
                 while !input.isReadyForMoreMediaData && writer.status == .writing { usleep(2000) }
                 guard writer.status == .writing else { throw writer.error ?? Failure("Writing stopped.") }
 
